@@ -12,7 +12,7 @@ import sqlite3
 # Util functions
 
 
-def build_numbered_users_list(users: list[Any]) -> str:
+def build_queue_string(users: list[Any]) -> str:
     return "\n".join([f"{i}) <@{user}>" for i, user in enumerate(users)])
 
 
@@ -79,7 +79,7 @@ class PersistentQueue:
             self.conn.commit()
 
     def clear_queue(self) -> None:
-        self.cursor.execute("TRUNCATE queue;")
+        self.cursor.execute("DELETE FROM queue;")
         self.conn.commit()
 
     def next(self) -> str | None:
@@ -203,9 +203,59 @@ def respond_queue(user_id: str) -> None:
         return
     else:
         size = p.get_num_users_in_queue()
-        numbered_users_list = build_numbered_users_list(users)
+        numbered_users_list = build_queue_string(users)
         send_message(f"There are {size} people in the queue.\n{numbered_users_list}")
         return
+
+
+def respond_clear_queue(user_id: str) -> None:
+    # TA only command
+    p = PersistentQueue()
+
+    if not p.is_user_a_ta(user_id):
+        send_message("TA command only, sorry.")
+        return
+
+    users = p.get_users_in_queue()
+    if not users:
+        send_message("Ain't nobody here.")
+        return
+
+    size = p.get_num_users_in_queue()
+    numbered_users_list = build_queue_string(users)
+
+    p.clear_queue()
+
+    send_message(f"The following {size} people were cleared from the queue:\n{numbered_users_list}", private=False)
+    return
+
+
+def respond_close_queue(user_id: str) -> None:
+    # TA only command
+    p = PersistentQueue()
+
+    if not p.is_user_a_ta(user_id):
+        send_message("TA command only, sorry.")
+        return
+
+    users = p.get_users_in_queue()
+    # if not users:
+        # send_message("Ain't nobody here.")
+        # return
+
+    numbered_users_list = build_queue_string(users)
+    send_message(
+        "Closing the queue for the night.\n\nSorry we couldn't get to everyone, "
+        "but don't worry--if you were on the queue an hour before the official closing time "
+        "(according to the schedule, not this message), you can still get credit tomorrow "
+        "as if you had passed off today."
+        f"\n\n{numbered_users_list}"
+        "\n\n'Night, y'all!",
+        private=False,
+    )
+
+    p.clear_queue()
+    return
 
 
 def run_action(action: str, user_id: str) -> None:
@@ -224,6 +274,10 @@ def run_action(action: str, user_id: str) -> None:
             respond_next(user_id)
         case "queue":
             respond_queue(user_id)
+        case "clearqueue":
+            respond_clear_queue(user_id)
+        case "closequeue":
+            respond_close_queue(user_id)
         case "dummy":
             respond_dummy()
         case _:
