@@ -116,9 +116,9 @@ class PrivateResponse(Response):
         super().__init__(text)
 
 
-def respond_wait(user_id: str) -> None:
+def respond_wait(requester_id: str) -> None:
     p = PersistentQueue()
-    position = p.get_postion_in_queue(user_id)
+    position = p.get_postion_in_queue(requester_id)
     size = p.get_num_users_in_queue()
     msg: str = f"There are {size} people in the queue!"
     if position is not None:
@@ -126,17 +126,17 @@ def respond_wait(user_id: str) -> None:
     send_message(msg)
 
 
-def respond_passoff(user_id: str) -> None:
+def respond_passoff(requester_id: str) -> None:
     p = PersistentQueue()
 
-    if p.is_user_in_queue(user_id):
+    if p.is_user_in_queue(requester_id):
         # they were already in the queue OR we couldn't add them for some reason
         send_message(
             "Couldn't add you to the queue; you're already in it! Patience grasshopper, we'll get to you soon."
         )
         return
 
-    position = p.add_user_to_queue(user_id)
+    position = p.add_user_to_queue(requester_id)
 
     if position is None:
         send_message(
@@ -147,20 +147,20 @@ def respond_passoff(user_id: str) -> None:
     send_message(f"You were added to the passoff queue. There are {position} people in front of you.", private=False)
 
 
-def respond_nevermind(user_id: str) -> None:
+def respond_nevermind(requester_id: str) -> None:
     p = PersistentQueue()
-    if not p.is_user_in_queue(user_id):
+    if not p.is_user_in_queue(requester_id):
         send_message("Couldn't remove you from the queue. Were you in it?")
     else:
-        p.remove_user_from_queue(user_id)
+        p.remove_user_from_queue(requester_id)
         send_message("You were removed from the queue. Come back soon.")
 
 
-def respond_next(user_id: str) -> None:
+def respond_next(requester_id: str) -> None:
     # TA only command
     p = PersistentQueue()
 
-    if not p.is_user_a_ta(user_id):
+    if not p.is_user_a_ta(requester_id):
         send_message("TA command only, sorry.")
         return
 
@@ -170,16 +170,16 @@ def respond_next(user_id: str) -> None:
         return
     else:
         send_message(
-            f"You are up <@{first}>. Please come in, or DM <@{user_id}> the link to your Zoom meeting.", private=False
+            f"You are up <@{first}>. Please come in, or DM <@{requester_id}> the link to your Zoom meeting.", private=False
         )
         return
 
 
-def respond_queue(user_id: str) -> None:
+def respond_queue(requester_id: str) -> None:
     # TA only command
     p = PersistentQueue()
 
-    if not p.is_user_a_ta(user_id):
+    if not p.is_user_a_ta(requester_id):
         send_message("TA command only, sorry.")
         return
 
@@ -194,11 +194,11 @@ def respond_queue(user_id: str) -> None:
         return
 
 
-def respond_clear_queue(user_id: str) -> None:
+def respond_clear_queue(requester_id: str) -> None:
     # TA only command
     p = PersistentQueue()
 
-    if not p.is_user_a_ta(user_id):
+    if not p.is_user_a_ta(requester_id):
         send_message("TA command only, sorry.")
         return
 
@@ -216,11 +216,11 @@ def respond_clear_queue(user_id: str) -> None:
     return
 
 
-def respond_close_queue(user_id: str) -> None:
+def respond_close_queue(requester_id: str) -> None:
     # TA only command
     p = PersistentQueue()
 
-    if not p.is_user_a_ta(user_id):
+    if not p.is_user_a_ta(requester_id):
         send_message("TA command only, sorry.")
         return
 
@@ -240,23 +240,23 @@ def respond_close_queue(user_id: str) -> None:
     return
 
 
-def run_action(action: str, user_id: str) -> None:
+def run_action(action: str, requester_id: str) -> None:
     # Handle the actual request
     match action:
         case "wait":
-            respond_wait(user_id)
+            respond_wait(requester_id)
         case "passoff":
-            respond_passoff(user_id)
+            respond_passoff(requester_id)
         case "nevermind":
-            respond_nevermind(user_id)
+            respond_nevermind(requester_id)
         case "next":
-            respond_next(user_id)
+            respond_next(requester_id)
         case "queue":
-            respond_queue(user_id)
+            respond_queue(requester_id)
         case "clearqueue":
-            respond_clear_queue(user_id)
+            respond_clear_queue(requester_id)
         case "closequeue":
-            respond_close_queue(user_id)
+            respond_close_queue(requester_id)
         case _:
             send_error(f"Unrecognized action: '{action}'")
 
@@ -274,8 +274,8 @@ def send_error(msg: str) -> None:
 
 def extract_info(http_get_data: Any, http_post_data: Any) -> tuple[str, str]:
     action = require_field("action", http_get_data, "Was this something other than a slash-command?")
-    user_id = require_field("user_id", http_post_data)
-    return action, user_id
+    requester_id = require_field("user_id", http_post_data)
+    return action, requester_id
 
 
 def require_field(field: str, data: dict[str, Any], err_msg: str = "") -> str:
@@ -304,8 +304,8 @@ def parse_args(args: list[str]) -> tuple[Any, Any]:
 
 def run(args: list[str]) -> None:
     http_get_data, http_post_data = parse_args(args)
-    action, user_id = extract_info(http_get_data, http_post_data)
-    run_action(action, user_id)
+    action, requester_id = extract_info(http_get_data, http_post_data)
+    run_action(action, requester_id)
 
 
 if __name__ == "__main__":
