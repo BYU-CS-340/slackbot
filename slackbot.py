@@ -240,7 +240,7 @@ def respond_close_queue(requester_id: str) -> None:
     return
 
 
-def run_action(action: str, requester_id: str) -> None:
+def run_action(action: str, args: list[str], requester_id: str) -> None:
     # Handle the actual request
     match action:
         case "wait":
@@ -258,7 +258,7 @@ def run_action(action: str, requester_id: str) -> None:
         case "closequeue":
             respond_close_queue(requester_id)
         case _:
-            send_error(f"Unrecognized action: '{action}'")
+            send_error(f"Unrecognized action: '{action}'. Args were '{args}'")
 
 
 def send_message(msg: str, private: bool = True) -> None:
@@ -272,10 +272,17 @@ def send_error(msg: str) -> None:
     sys.exit(1)
 
 
-def extract_info(http_get_data: Any, http_post_data: Any) -> tuple[str, str]:
-    action = require_field("action", http_get_data, "Was this something other than a slash-command?")
+def extract_info(http_post_data: Any) -> tuple[str, list[str], str]:
+    action = require_field("command", http_post_data)
+    action = action[1:]  # Remove leading "/" character
+
+    args_str = require_field("text", http_post_data)
+    args = args_str.strip().split(" ")  # replace "arg1 arg2" with ["arg1", "arg2"],
+    args = [a for a in args if a != ""]  # filter out empty-string args
+
     requester_id = require_field("user_id", http_post_data)
-    return action, requester_id
+
+    return action, args, requester_id
 
 
 def require_field(field: str, data: dict[str, Any], err_msg: str = "") -> str:
@@ -302,10 +309,10 @@ def parse_args(args: list[str]) -> tuple[Any, Any]:
     return http_get_data, http_post_data
 
 
-def run(args: list[str]) -> None:
-    http_get_data, http_post_data = parse_args(args)
-    action, requester_id = extract_info(http_get_data, http_post_data)
-    run_action(action, requester_id)
+def run(argv: list[str]) -> None:
+    http_get_data, http_post_data = parse_args(argv)
+    action, cmd_args, requester_id = extract_info(http_post_data)
+    run_action(action, cmd_args, requester_id)
 
 
 if __name__ == "__main__":
