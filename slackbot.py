@@ -116,20 +116,6 @@ class PrivateResponse(Response):
         super().__init__(text)
 
 
-# when / is hit, respond with info about the queue
-def respond_none(action: str) -> None:
-    p = PersistentQueue()
-    result = ", ".join(p.get_users_in_queue())
-    send_message(f"Online. action = {action},  queued users = {result}")
-
-
-def respond_dummy() -> None:
-    user = f"dummy{random.randint(0, 100)}"
-    p = PersistentQueue()
-    position = p.add_user_to_queue(user)
-    send_message(f"Added a dummy user, position response is {position}")
-
-
 def respond_wait(user_id: str) -> None:
     p = PersistentQueue()
     position = p.get_postion_in_queue(user_id)
@@ -239,10 +225,6 @@ def respond_close_queue(user_id: str) -> None:
         return
 
     users = p.get_users_in_queue()
-    # if not users:
-        # send_message("Ain't nobody here.")
-        # return
-
     numbered_users_list = build_queue_string(users)
     send_message(
         "Closing the queue for the night.\n\nSorry we couldn't get to everyone, "
@@ -260,10 +242,7 @@ def respond_close_queue(user_id: str) -> None:
 
 def run_action(action: str, user_id: str) -> None:
     # Handle the actual request
-    # action = htmlspecialchars(_GET["action"] ?? 'none')
     match action:
-        case "none":
-            respond_none(action)
         case "wait":
             respond_wait(user_id)
         case "passoff":
@@ -278,10 +257,8 @@ def run_action(action: str, user_id: str) -> None:
             respond_clear_queue(user_id)
         case "closequeue":
             respond_close_queue(user_id)
-        case "dummy":
-            respond_dummy()
         case _:
-            respond_none(action)
+            send_error(f"Unrecognized action: '{action}'")
 
 
 def send_message(msg: str, private: bool = True) -> None:
