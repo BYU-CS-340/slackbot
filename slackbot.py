@@ -224,6 +224,10 @@ def handle_close_queue(req: Request) -> None:
     return
 
 
+def handle_bottest(req: Request) -> None:
+    send_message(f"action: '{req.action}'\nargs: {req.args}\nrequester_id: '{req.requester_id}'")
+
+
 def run_action(req: Request) -> None:
     student_handlers: dict[str, Callable[[Request], None]] = {
         "wait": handle_wait,
@@ -236,6 +240,7 @@ def run_action(req: Request) -> None:
         "next": handle_next,
         "clearqueue": handle_clear_queue,
         "closequeue": handle_close_queue,
+        "bottest": handle_bottest,
     }
 
     if req.action in student_handlers:
