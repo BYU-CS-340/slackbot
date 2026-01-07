@@ -3,7 +3,6 @@
 import sys
 import json
 import os
-import random
 from typing import Any
 
 import sqlite3
@@ -99,6 +98,13 @@ class PersistentQueue:
         return user_id in ta_user_ids
 
 
+class Request:
+    def __init__(self, action: str, args: list[str], requester_id: str) -> None:
+        self.action: str = action
+        self.args: list[str] = args
+        self.requester_id: str = requester_id
+
+
 class Response:
     def __init__(self, text: str) -> None:
         self.text: str = text
@@ -116,9 +122,12 @@ class PrivateResponse(Response):
         super().__init__(text)
 
 
-def respond_wait(requester_id: str) -> None:
+# Action handlers
+
+
+def handle_wait(req: Request) -> None:
     p = PersistentQueue()
-    position = p.get_postion_in_queue(requester_id)
+    position = p.get_postion_in_queue(req.requester_id)
     size = p.get_num_users_in_queue()
     msg: str = f"There are {size} people in the queue!"
     if position is not None:
@@ -126,17 +135,17 @@ def respond_wait(requester_id: str) -> None:
     send_message(msg)
 
 
-def respond_passoff(requester_id: str) -> None:
+def handle_passoff(req: Request) -> None:
     p = PersistentQueue()
 
-    if p.is_user_in_queue(requester_id):
+    if p.is_user_in_queue(req.requester_id):
         # they were already in the queue OR we couldn't add them for some reason
         send_message(
             "Couldn't add you to the queue; you're already in it! Patience grasshopper, we'll get to you soon."
         )
         return
 
-    position = p.add_user_to_queue(requester_id)
+    position = p.add_user_to_queue(req.requester_id)
 
     if position is None:
         send_message(
@@ -147,20 +156,20 @@ def respond_passoff(requester_id: str) -> None:
     send_message(f"You were added to the passoff queue. There are {position} people in front of you.", private=False)
 
 
-def respond_nevermind(requester_id: str) -> None:
+def handle_nevermind(req: Request) -> None:
     p = PersistentQueue()
-    if not p.is_user_in_queue(requester_id):
+    if not p.is_user_in_queue(req.requester_id):
         send_message("Couldn't remove you from the queue. Were you in it?")
     else:
-        p.remove_user_from_queue(requester_id)
+        p.remove_user_from_queue(req.requester_id)
         send_message("You were removed from the queue. Come back soon.")
 
 
-def respond_next(requester_id: str) -> None:
+def handle_next(req: Request) -> None:
     # TA only command
     p = PersistentQueue()
 
-    if not p.is_user_a_ta(requester_id):
+    if not p.is_user_a_ta(req.requester_id):
         send_message("TA command only, sorry.")
         return
 
@@ -170,16 +179,16 @@ def respond_next(requester_id: str) -> None:
         return
     else:
         send_message(
-            f"You are up <@{first}>. Please come in, or DM <@{requester_id}> the link to your Zoom meeting.", private=False
+            f"You are up <@{first}>. Please come in, or DM <@{req.requester_id}> the link to your Zoom meeting.", private=False
         )
         return
 
 
-def respond_queue(requester_id: str) -> None:
+def handle_queue(req: Request) -> None:
     # TA only command
     p = PersistentQueue()
 
-    if not p.is_user_a_ta(requester_id):
+    if not p.is_user_a_ta(req.requester_id):
         send_message("TA command only, sorry.")
         return
 
@@ -194,11 +203,11 @@ def respond_queue(requester_id: str) -> None:
         return
 
 
-def respond_clear_queue(requester_id: str) -> None:
+def handle_clear_queue(req: Request) -> None:
     # TA only command
     p = PersistentQueue()
 
-    if not p.is_user_a_ta(requester_id):
+    if not p.is_user_a_ta(req.requester_id):
         send_message("TA command only, sorry.")
         return
 
@@ -216,11 +225,11 @@ def respond_clear_queue(requester_id: str) -> None:
     return
 
 
-def respond_close_queue(requester_id: str) -> None:
+def handle_close_queue(req: Request) -> None:
     # TA only command
     p = PersistentQueue()
 
-    if not p.is_user_a_ta(requester_id):
+    if not p.is_user_a_ta(req.requester_id):
         send_message("TA command only, sorry.")
         return
 
@@ -240,25 +249,25 @@ def respond_close_queue(requester_id: str) -> None:
     return
 
 
-def run_action(action: str, args: list[str], requester_id: str) -> None:
+def run_action(req: Request) -> None:
     # Handle the actual request
-    match action:
+    match req.action:
         case "wait":
-            respond_wait(requester_id)
+            handle_wait(req)
         case "passoff":
-            respond_passoff(requester_id)
+            handle_passoff(req)
         case "nevermind":
-            respond_nevermind(requester_id)
+            handle_nevermind(req)
         case "next":
-            respond_next(requester_id)
+            handle_next(req)
         case "queue":
-            respond_queue(requester_id)
+            handle_queue(req)
         case "clearqueue":
-            respond_clear_queue(requester_id)
+            handle_clear_queue(req)
         case "closequeue":
-            respond_close_queue(requester_id)
+            handle_close_queue(req)
         case _:
-            send_error(f"Unrecognized action: '{action}'. Args were '{args}'")
+            send_error(f"Unrecognized action: '{req.action}'. Args were '{req.args}'")
 
 
 def send_message(msg: str, private: bool = True) -> None:
@@ -272,7 +281,7 @@ def send_error(msg: str) -> None:
     sys.exit(1)
 
 
-def extract_info(http_post_data: Any) -> tuple[str, list[str], str]:
+def extract_info(http_post_data: Any) -> Request:
     action = require_field("command", http_post_data)
     action = action[1:]  # Remove leading "/" character
 
@@ -282,7 +291,7 @@ def extract_info(http_post_data: Any) -> tuple[str, list[str], str]:
 
     requester_id = require_field("user_id", http_post_data)
 
-    return action, args, requester_id
+    return Request(action, args, requester_id)
 
 
 def require_field(field: str, data: dict[str, Any], err_msg: str = "") -> str:
@@ -311,8 +320,8 @@ def parse_args(args: list[str]) -> tuple[Any, Any]:
 
 def run(argv: list[str]) -> None:
     http_get_data, http_post_data = parse_args(argv)
-    action, cmd_args, requester_id = extract_info(http_post_data)
-    run_action(action, cmd_args, requester_id)
+    request = extract_info(http_post_data)
+    run_action(request)
 
 
 if __name__ == "__main__":
