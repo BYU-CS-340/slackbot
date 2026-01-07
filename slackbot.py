@@ -3,7 +3,7 @@
 import sys
 import json
 import os
-from typing import Any
+from typing import Any, Callable
 
 import sqlite3
 
@@ -166,13 +166,7 @@ def handle_nevermind(req: Request) -> None:
 
 
 def handle_next(req: Request) -> None:
-    # TA only command
     p = PersistentQueue()
-
-    if not p.is_user_a_ta(req.requester_id):
-        send_message("TA command only, sorry.")
-        return
-
     first = p.next()
     if first is None:
         send_message("Hmm, no one is in the queue, so nothing was done.")
@@ -185,13 +179,7 @@ def handle_next(req: Request) -> None:
 
 
 def handle_queue(req: Request) -> None:
-    # TA only command
     p = PersistentQueue()
-
-    if not p.is_user_a_ta(req.requester_id):
-        send_message("TA command only, sorry.")
-        return
-
     users = p.get_users_in_queue()
     if not users:
         send_message("Ain't nobody here.")
@@ -204,13 +192,7 @@ def handle_queue(req: Request) -> None:
 
 
 def handle_clear_queue(req: Request) -> None:
-    # TA only command
     p = PersistentQueue()
-
-    if not p.is_user_a_ta(req.requester_id):
-        send_message("TA command only, sorry.")
-        return
-
     users = p.get_users_in_queue()
     if not users:
         send_message("Ain't nobody here.")
@@ -226,13 +208,7 @@ def handle_clear_queue(req: Request) -> None:
 
 
 def handle_close_queue(req: Request) -> None:
-    # TA only command
     p = PersistentQueue()
-
-    if not p.is_user_a_ta(req.requester_id):
-        send_message("TA command only, sorry.")
-        return
-
     users = p.get_users_in_queue()
     numbered_users_list = build_queue_string(users)
     send_message(
@@ -244,30 +220,39 @@ def handle_close_queue(req: Request) -> None:
         "\n\n'Night, y'all!",
         private=False,
     )
-
     p.clear_queue()
     return
 
 
 def run_action(req: Request) -> None:
-    # Handle the actual request
-    match req.action:
-        case "wait":
-            handle_wait(req)
-        case "passoff":
-            handle_passoff(req)
-        case "nevermind":
-            handle_nevermind(req)
-        case "next":
-            handle_next(req)
-        case "queue":
-            handle_queue(req)
-        case "clearqueue":
-            handle_clear_queue(req)
-        case "closequeue":
-            handle_close_queue(req)
-        case _:
-            send_error(f"Unrecognized action: '{req.action}'. Args were '{req.args}'")
+    student_handlers: dict[str, Callable[[Request], None]] = {
+        "wait": handle_wait,
+        "passoff": handle_passoff,
+        "nevermind": handle_nevermind,
+        "queue": handle_queue,
+    }
+
+    ta_only_handlers: dict[str, Callable[[Request], None]] = {
+        "next": handle_next,
+        "clearqueue": handle_clear_queue,
+        "closequeue": handle_close_queue,
+    }
+
+    if req.action in student_handlers:
+        handler = student_handlers[req.action]
+        handler(req)
+        return
+
+    if req.action in ta_only_handlers:
+        p = PersistentQueue()
+        if not p.is_user_a_ta(req.requester_id):
+            send_message("TA command only, sorry.")
+            return
+        handler = ta_only_handlers[req.action]
+        handler(req)
+        return
+
+    send_error(f"Unrecognized action: '{req.action}'. Args were '{req.args}'")
 
 
 def send_message(msg: str, private: bool = True) -> None:
