@@ -1,12 +1,16 @@
 # Copyright 2025 Brigham Young University. All rights reserved.
 
+from pathlib import Path
+import re
 import sys
 import json
 import os
-import random
-from typing import Any
+from typing import Any, Callable
 
 import sqlite3
+
+
+TA_DICT_PATH = Path("./secrets/ta_slack_member_ids.json")
 
 
 # Util functions
@@ -94,9 +98,16 @@ class PersistentQueue:
         return first
 
     def is_user_a_ta(self, user_id: str) -> bool:
-        with open("./secrets/ta_slack_user_ids.json", "r") as f:
+        with TA_DICT_PATH.open("r") as f:
             ta_user_ids = json.load(f)
         return user_id in ta_user_ids
+
+
+class Request:
+    def __init__(self, action: str, args: list[str], requester_id: str) -> None:
+        self.action: str = action
+        self.args: list[str] = args
+        self.requester_id: str = requester_id
 
 
 class Response:
@@ -116,23 +127,12 @@ class PrivateResponse(Response):
         super().__init__(text)
 
 
-# when / is hit, respond with info about the queue
-def respond_none(action: str) -> None:
+# Action handlers
+
+
+def handle_wait(req: Request) -> None:
     p = PersistentQueue()
-    result = ", ".join(p.get_users_in_queue())
-    send_message(f"Online. action = {action},  queued users = {result}")
-
-
-def respond_dummy() -> None:
-    user = f"dummy{random.randint(0, 100)}"
-    p = PersistentQueue()
-    position = p.add_user_to_queue(user)
-    send_message(f"Added a dummy user, position response is {position}")
-
-
-def respond_wait(user_id: str) -> None:
-    p = PersistentQueue()
-    position = p.get_postion_in_queue(user_id)
+    position = p.get_postion_in_queue(req.requester_id)
     size = p.get_num_users_in_queue()
     msg: str = f"There are {size} people in the queue!"
     if position is not None:
@@ -140,17 +140,17 @@ def respond_wait(user_id: str) -> None:
     send_message(msg)
 
 
-def respond_passoff(user_id: str) -> None:
+def handle_passoff(req: Request) -> None:
     p = PersistentQueue()
 
-    if p.is_user_in_queue(user_id):
+    if p.is_user_in_queue(req.requester_id):
         # they were already in the queue OR we couldn't add them for some reason
         send_message(
             "Couldn't add you to the queue; you're already in it! Patience grasshopper, we'll get to you soon."
         )
         return
 
-    position = p.add_user_to_queue(user_id)
+    position = p.add_user_to_queue(req.requester_id)
 
     if position is None:
         send_message(
@@ -161,42 +161,38 @@ def respond_passoff(user_id: str) -> None:
     send_message(f"You were added to the passoff queue. There are {position} people in front of you.", private=False)
 
 
-def respond_nevermind(user_id: str) -> None:
+def handle_nevermind(req: Request) -> None:
+    if req.args:
+        require_ta_or_halt(req, "Students can only remove themselves, by using /nevermind with no arguments.")
+        user_id, _ = parse_arg_as_user(req.args[0])
+        pronoun = "they"
+    else:
+        user_id = req.requester_id
+        pronoun = "you"
+
     p = PersistentQueue()
     if not p.is_user_in_queue(user_id):
-        send_message("Couldn't remove you from the queue. Were you in it?")
+        send_message(f"Couldn't remove {pronoun} from the queue. Were {pronoun} in it?")
     else:
-        p.remove_user_from_queue(user_id)
-        send_message("You were removed from the queue. Come back soon.")
+        p.remove_user_from_queue(req.requester_id)
+        send_message(f"Successfully removed {pronoun} from the queue.")
 
 
-def respond_next(user_id: str) -> None:
-    # TA only command
+def handle_next(req: Request) -> None:
     p = PersistentQueue()
-
-    if not p.is_user_a_ta(user_id):
-        send_message("TA command only, sorry.")
-        return
-
     first = p.next()
     if first is None:
         send_message("Hmm, no one is in the queue, so nothing was done.")
         return
     else:
         send_message(
-            f"You are up <@{first}>. Please come in, or DM <@{user_id}> the link to your Zoom meeting.", private=False
+            f"You are up <@{first}>. Please come in, or DM <@{req.requester_id}> the link to your Zoom meeting.", private=False
         )
         return
 
 
-def respond_queue(user_id: str) -> None:
-    # TA only command
+def handle_queue(req: Request) -> None:
     p = PersistentQueue()
-
-    if not p.is_user_a_ta(user_id):
-        send_message("TA command only, sorry.")
-        return
-
     users = p.get_users_in_queue()
     if not users:
         send_message("Ain't nobody here.")
@@ -208,14 +204,8 @@ def respond_queue(user_id: str) -> None:
         return
 
 
-def respond_clear_queue(user_id: str) -> None:
-    # TA only command
+def handle_clear_queue(req: Request) -> None:
     p = PersistentQueue()
-
-    if not p.is_user_a_ta(user_id):
-        send_message("TA command only, sorry.")
-        return
-
     users = p.get_users_in_queue()
     if not users:
         send_message("Ain't nobody here.")
@@ -230,19 +220,9 @@ def respond_clear_queue(user_id: str) -> None:
     return
 
 
-def respond_close_queue(user_id: str) -> None:
-    # TA only command
+def handle_close_queue(req: Request) -> None:
     p = PersistentQueue()
-
-    if not p.is_user_a_ta(user_id):
-        send_message("TA command only, sorry.")
-        return
-
     users = p.get_users_in_queue()
-    # if not users:
-        # send_message("Ain't nobody here.")
-        # return
-
     numbered_users_list = build_queue_string(users)
     send_message(
         "Closing the queue for the night.\n\nSorry we couldn't get to everyone, "
@@ -253,35 +233,85 @@ def respond_close_queue(user_id: str) -> None:
         "\n\n'Night, y'all!",
         private=False,
     )
-
     p.clear_queue()
     return
 
 
-def run_action(action: str, user_id: str) -> None:
-    # Handle the actual request
-    # action = htmlspecialchars(_GET["action"] ?? 'none')
-    match action:
-        case "none":
-            respond_none(action)
-        case "wait":
-            respond_wait(user_id)
-        case "passoff":
-            respond_passoff(user_id)
-        case "nevermind":
-            respond_nevermind(user_id)
-        case "next":
-            respond_next(user_id)
-        case "queue":
-            respond_queue(user_id)
-        case "clearqueue":
-            respond_clear_queue(user_id)
-        case "closequeue":
-            respond_close_queue(user_id)
-        case "dummy":
-            respond_dummy()
-        case _:
-            respond_none(action)
+def handle_ta(req: Request) -> None:
+    with TA_DICT_PATH.open("r") as f:
+        ta_dict = json.load(f)
+
+    if len(req.args) == 0:
+        send_message(f"Current TA list:\n{ta_dict}")
+        return
+    if len(req.args) != 2:
+        send_error("Invalid usage. This command needs 0 or 2 arguments.")
+        return
+
+    subcmd = req.args[0]
+    specified_user_id, specified_user_name = parse_arg_as_user(req.args[1])
+
+    if subcmd == "add":
+        if specified_user_id in ta_dict:
+            send_message("User is already a TA.")
+            return
+        ta_dict[specified_user_id] = specified_user_name
+
+    elif subcmd == "rmv":
+        if specified_user_id not in ta_dict:
+            send_message("User is not currently a TA.")
+            return
+        del ta_dict[specified_user_id]
+
+    else:
+        send_error("Invalid usage. Valid subcommands are '/ta add <user>' and '/ta rmv <user>'")
+        return
+
+    with TA_DICT_PATH.open("w") as f:
+        json.dump(ta_dict, f)
+    send_message("Success! (Probably.)")
+
+
+def handle_bottest(req: Request) -> None:
+    msg = f"action: '{req.action}'\nargs: {req.args}\nrequester_id: '{req.requester_id}'"
+    send_message(msg)
+
+
+def run_action(req: Request) -> None:
+    student_handlers: dict[str, Callable[[Request], None]] = {
+        "wait": handle_wait,
+        "passoff": handle_passoff,
+        "nevermind": handle_nevermind,
+        "queue": handle_queue,
+    }
+
+    ta_only_handlers: dict[str, Callable[[Request], None]] = {
+        "next": handle_next,
+        "clearqueue": handle_clear_queue,
+        "closequeue": handle_close_queue,
+        "ta": handle_ta,
+        "bottest": handle_bottest,
+    }
+
+    if req.action in student_handlers:
+        handler = student_handlers[req.action]
+        handler(req)
+        return
+
+    if req.action in ta_only_handlers:
+        require_ta_or_halt(req)
+        handler = ta_only_handlers[req.action]
+        handler(req)
+        return
+
+    send_error(f"Unrecognized action: '{req.action}'. Args were '{req.args}'")
+
+
+def require_ta_or_halt(req: Request, msg: str = "") -> None:
+        p = PersistentQueue()
+        if not p.is_user_a_ta(req.requester_id):
+            send_message("TA command only, sorry. " + msg)
+            sys.exit()
 
 
 def send_message(msg: str, private: bool = True) -> None:
@@ -295,10 +325,26 @@ def send_error(msg: str) -> None:
     sys.exit(1)
 
 
-def extract_info(http_get_data: Any, http_post_data: Any) -> tuple[str, str]:
-    action = require_field("action", http_get_data, "Was this something other than a slash-command?")
-    user_id = require_field("user_id", http_post_data)
-    return action, user_id
+def parse_arg_as_user(raw_arg: str) -> tuple[str, str]:
+    pattern = re.compile(r"<@(.*)\|(.*)>")
+    match = pattern.search(raw_arg)
+    if match:
+        user_id, user_name = match.groups()
+    else:
+        send_error(f"Invalid user argument '{raw_arg}'. Does that user not exist, or did you forget to @-mention them?")
+    return user_id, user_name
+
+def extract_info(http_post_data: Any) -> Request:
+    action = require_field("command", http_post_data)
+    action = action[1:]  # Remove leading "/" character
+
+    args_str = require_field("text", http_post_data)
+    args = args_str.strip().split(" ")  # replace "arg1 arg2" with ["arg1", "arg2"],
+    args = [a for a in args if a != ""]  # filter out empty-string args
+
+    requester_id = require_field("user_id", http_post_data)
+
+    return Request(action, args, requester_id)
 
 
 def require_field(field: str, data: dict[str, Any], err_msg: str = "") -> str:
@@ -325,10 +371,10 @@ def parse_args(args: list[str]) -> tuple[Any, Any]:
     return http_get_data, http_post_data
 
 
-def run(args: list[str]) -> None:
-    http_get_data, http_post_data = parse_args(args)
-    action, user_id = extract_info(http_get_data, http_post_data)
-    run_action(action, user_id)
+def run(argv: list[str]) -> None:
+    http_get_data, http_post_data = parse_args(argv)
+    request = extract_info(http_post_data)
+    run_action(request)
 
 
 if __name__ == "__main__":
