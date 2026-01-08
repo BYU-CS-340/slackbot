@@ -162,12 +162,20 @@ def handle_passoff(req: Request) -> None:
 
 
 def handle_nevermind(req: Request) -> None:
+    if req.args:
+        require_ta_or_halt(req, "Students can only remove themselves, by using /nevermind with no arguments.")
+        user_id, _ = parse_arg_as_user(req.args[0])
+        pronoun = "they"
+    else:
+        user_id = req.requester_id
+        pronoun = "you"
+
     p = PersistentQueue()
-    if not p.is_user_in_queue(req.requester_id):
-        send_message("Couldn't remove you from the queue. Were you in it?")
+    if not p.is_user_in_queue(user_id):
+        send_message(f"Couldn't remove {pronoun} from the queue. Were {pronoun} in it?")
     else:
         p.remove_user_from_queue(req.requester_id)
-        send_message("You were removed from the queue. Come back soon.")
+        send_message(f"Successfully removed {pronoun} from the queue.")
 
 
 def handle_next(req: Request) -> None:
@@ -291,15 +299,19 @@ def run_action(req: Request) -> None:
         return
 
     if req.action in ta_only_handlers:
-        p = PersistentQueue()
-        if not p.is_user_a_ta(req.requester_id):
-            send_message("TA command only, sorry.")
-            return
+        require_ta_or_halt(req)
         handler = ta_only_handlers[req.action]
         handler(req)
         return
 
     send_error(f"Unrecognized action: '{req.action}'. Args were '{req.args}'")
+
+
+def require_ta_or_halt(req: Request, msg: str = "") -> None:
+        p = PersistentQueue()
+        if not p.is_user_a_ta(req.requester_id):
+            send_message("TA command only, sorry. " + msg)
+            sys.exit()
 
 
 def send_message(msg: str, private: bool = True) -> None:
