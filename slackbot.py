@@ -242,7 +242,8 @@ def handle_ta(req: Request) -> None:
         ta_dict = json.load(f)
 
     if len(req.args) == 0:
-        send_message(f"Current TA list:\n{ta_dict}")
+        ta_list_string = "\n".join([f"<@{ta_dict[ta_id]}> ({ta_id})" for ta_id in ta_dict])
+        send_message(f"Current TA list:\n{ta_list_string}")
         return
     if len(req.args) != 2:
         send_error("Invalid usage. This command needs 0 or 2 arguments.")
@@ -269,7 +270,7 @@ def handle_ta(req: Request) -> None:
 
     with TA_DICT_PATH.open("w") as f:
         json.dump(ta_dict, f)
-    send_message("Success! (Probably.)")
+    send_message("Updated TA list successfully.")
 
 
 def handle_bottest(req: Request) -> None:
