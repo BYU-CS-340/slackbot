@@ -1,11 +1,16 @@
 # Copyright 2025 Brigham Young University. All rights reserved.
 
+from pathlib import Path
+import re
 import sys
 import json
 import os
 from typing import Any, Callable
 
 import sqlite3
+
+
+TA_DICT_PATH = Path("./secrets/ta_slack_member_ids.json")
 
 
 # Util functions
@@ -93,7 +98,7 @@ class PersistentQueue:
         return first
 
     def is_user_a_ta(self, user_id: str) -> bool:
-        with open("./secrets/ta_slack_user_ids.json", "r") as f:
+        with TA_DICT_PATH.open("r") as f:
             ta_user_ids = json.load(f)
         return user_id in ta_user_ids
 
@@ -270,6 +275,15 @@ def send_error(msg: str) -> None:
     send_message(f"Error (please contact a TA!): {msg}")
     sys.exit(1)
 
+
+def parse_arg_as_user(raw_arg: str) -> tuple[str, str]:
+    pattern = re.compile(r"<@(.*)\|(.*)>")
+    match = pattern.search(raw_arg)
+    if match:
+        user_id, user_name = match.groups()
+    else:
+        send_error(f"Invalid user argument '{raw_arg}'. Does that user not exist, or did you forget to @-mention them?")
+    return user_id, user_name
 
 def extract_info(http_post_data: Any) -> Request:
     action = require_field("command", http_post_data)
