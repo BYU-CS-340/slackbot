@@ -229,8 +229,44 @@ def handle_close_queue(req: Request) -> None:
     return
 
 
+def handle_ta(req: Request) -> None:
+    with TA_DICT_PATH.open("r") as f:
+        ta_dict = json.load(f)
+
+    if len(req.args) == 0:
+        send_message(f"Current TA list:\n{ta_dict}")
+        return
+    if len(req.args) != 2:
+        send_error("Invalid usage. This command needs 0 or 2 arguments.")
+        return
+
+    subcmd = req.args[0]
+    specified_user_id, specified_user_name = parse_arg_as_user(req.args[1])
+
+    if subcmd == "add":
+        if specified_user_id in ta_dict:
+            send_message("User is already a TA.")
+            return
+        ta_dict[specified_user_id] = specified_user_name
+
+    elif subcmd == "rmv":
+        if specified_user_id not in ta_dict:
+            send_message("User is not currently a TA.")
+            return
+        del ta_dict[specified_user_id]
+
+    else:
+        send_error("Invalid usage. Valid subcommands are '/ta add <user>' and '/ta rmv <user>'")
+        return
+
+    with TA_DICT_PATH.open("w") as f:
+        json.dump(ta_dict, f)
+    send_message("Success! (Probably.)")
+
+
 def handle_bottest(req: Request) -> None:
-    send_message(f"action: '{req.action}'\nargs: {req.args}\nrequester_id: '{req.requester_id}'")
+    msg = f"action: '{req.action}'\nargs: {req.args}\nrequester_id: '{req.requester_id}'"
+    send_message(msg)
 
 
 def run_action(req: Request) -> None:
@@ -245,6 +281,7 @@ def run_action(req: Request) -> None:
         "next": handle_next,
         "clearqueue": handle_clear_queue,
         "closequeue": handle_close_queue,
+        "ta": handle_ta,
         "bottest": handle_bottest,
     }
 
