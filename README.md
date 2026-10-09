@@ -4,6 +4,19 @@ This repo contains the application code for `ABSOLUTELY USELESS TWEETER BOT`, th
 
 The Slack bot is currently a PHP server, but that is being phased out in favor of Python. So far, all logic and functionality has been moved into `slackbot.py`. The server entry point is still `index.php`, but all it does is call slackbot.py with the HTTP request data.
 
+## Passoff queues
+
+- Students join with `/passoff-online` or `/passoff-inperson`. A student can only be in one queue; use `/nevermind` before switching, which resets their place.
+- TAs use `/next` to call the longest-waiting student across both queues, or `/next-online` and `/next-inperson` to call the oldest student in that queue.
+- `/queue` lists both queues. `/wait` reports both sizes and the student's position in their queue and across both. Positions count people ahead, starting at zero.
+- `/nevermind` removes the requester from either queue. TAs can use `/nevermind @student` to remove that student.
+- `/clearqueue` and `/closequeue` clear both queues. Closing announces the closure and clears the queues; it does not disable new joins.
+- `/passoff` now prompts students to choose a queue. `/ta` and `/bottest` retain their existing behavior.
+
+Register `/passoff-online`, `/passoff-inperson`, `/next-online`, and `/next-inperson` in the Slack app with the same Request URL as the existing commands, as described below.
+
+The database migrates automatically on first use. Existing students enter the in-person queue with their order preserved. Both queues share a table with a queue type and global insertion order for first-come, first-served selection. Back up the database before deployment.
+
 ## Updating the list of TAs
 
 To add or remove TAs, use the `/ta add @Alice` and `/ta rmv @Bob` commands. `/ta` with no arguments prints the current list of TAs.

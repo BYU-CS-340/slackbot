@@ -25,77 +25,93 @@ def build_queue_string(users: list[Any]) -> str:
 
 
 class PersistentQueue:
+    QUEUE_TYPES = ("online", "inperson")
+
     def __init__(self) -> None:
         db_name = "./db/queue.sqlite"
+        Path(db_name).parent.mkdir(parents=True, exist_ok=True)
         db_exists = os.path.exists(db_name)
-
         self.conn = sqlite3.connect(db_name)
         self.cursor = self.conn.cursor()
-
-        # self.busyTimeout(3000)
-
         if not db_exists:
             os.chmod(db_name, 0o777)
-            self.create_tables()
+        self.create_tables()
 
     def __del__(self) -> None:
-        self.cursor.close()
+        if hasattr(self, "conn"):
+            self.conn.close()
 
     def create_tables(self) -> None:
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS queue(user TEXT NOT NULL);")
-        self.conn.commit()
+        # Serialize migration with joins/dequeues from other HTTP requests.
+        with self.conn:
+            self.cursor.execute("BEGIN IMMEDIATE")
+            self.cursor.execute("CREATE TABLE IF NOT EXISTS queue(user TEXT NOT NULL);")
+            columns = {row[1] for row in self.cursor.execute("PRAGMA table_info(queue)")}
+            if "queue_type" not in columns:
+                # Preserve existing students and their original rowid/join order.
+                self.cursor.execute(
+                    "ALTER TABLE queue ADD COLUMN queue_type TEXT NOT NULL "
+                    "DEFAULT 'inperson' CHECK(queue_type IN ('online', 'inperson'))"
+                )
 
-    def get_users_in_queue(self) -> list[str]:
-        self.cursor.execute("SELECT * FROM queue;")
-        results = self.cursor.fetchall()
-        user_ids = [row[0] for row in results]
-        return user_ids
+    def get_entries(self, queue_type: str | None = None) -> list[tuple[str, str]]:
+        if queue_type is None:
+            self.cursor.execute("SELECT user, queue_type FROM queue ORDER BY rowid")
+        else:
+            self.cursor.execute(
+                "SELECT user, queue_type FROM queue WHERE queue_type = ? ORDER BY rowid",
+                [queue_type],
+            )
+        return self.cursor.fetchall()
 
-    def get_postion_in_queue(self, user_id: str) -> int | None:
-        users_in_queue = self.get_users_in_queue()
-        position = 0
-        while position < len(users_in_queue) and users_in_queue[position] != user_id:
-            position += 1
-        if position >= len(users_in_queue):
-            return None
-        return position
+    def get_users_in_queue(self, queue_type: str | None = None) -> list[str]:
+        return [user for user, _ in self.get_entries(queue_type)]
 
-    def get_num_users_in_queue(self) -> int:
-        users_in_queue = self.get_users_in_queue()
-        return len(users_in_queue)
+    def get_postion_in_queue(self, user_id: str, queue_type: str | None = None) -> int | None:
+        users = self.get_users_in_queue(queue_type)
+        return users.index(user_id) if user_id in users else None
+
+    def get_num_users_in_queue(self, queue_type: str | None = None) -> int:
+        return len(self.get_users_in_queue(queue_type))
 
     def is_user_in_queue(self, user_id: str) -> bool:
-        users_in_queue = self.get_users_in_queue()
-        return user_id in users_in_queue
+        return user_id in self.get_users_in_queue()
 
-    def add_user_to_queue(self, user_id: str) -> int | None:
-        position = self.get_postion_in_queue(user_id)
-        if position is not None:
-            # already in the queue
-            return None
-        self.cursor.execute("INSERT INTO queue VALUES (?);", [user_id])
-        self.conn.commit()
-        return self.get_postion_in_queue(user_id)
+    def add_user_to_queue(self, user_id: str, queue_type: str = "inperson") -> int | None:
+        if queue_type not in self.QUEUE_TYPES:
+            raise ValueError(f"Unknown queue: {queue_type}")
+        with self.conn:
+            self.cursor.execute("BEGIN IMMEDIATE")
+            if self.is_user_in_queue(user_id):
+                return None
+            self.cursor.execute(
+                "INSERT INTO queue (user, queue_type) VALUES (?, ?)", [user_id, queue_type]
+            )
+            return self.get_postion_in_queue(user_id, queue_type)
 
     def remove_user_from_queue(self, user_id: str) -> None:
-        if self.is_user_in_queue(user_id):
-            self.cursor.execute("DELETE FROM queue WHERE user = ?;", [user_id])
-            self.conn.commit()
+        with self.conn:
+            self.cursor.execute("DELETE FROM queue WHERE user = ?", [user_id])
 
     def clear_queue(self) -> None:
-        self.cursor.execute("DELETE FROM queue;")
-        self.conn.commit()
+        with self.conn:
+            self.cursor.execute("DELETE FROM queue")
 
-    def next(self) -> str | None:
-        # intentionally not doing a transaction here, unlikely to occur. simplify....
-        users = self.get_users_in_queue()
-        if not users:
-            return None
+    def next_entry(self, queue_type: str | None = None) -> tuple[str, str] | None:
+        # rowid orders all joins, including ties in wall-clock time. Taking the
+        # oldest entry and removing it must be atomic across concurrent TAs.
+        with self.conn:
+            self.cursor.execute("BEGIN IMMEDIATE")
+            entries = self.get_entries(queue_type)
+            if not entries:
+                return None
+            first = entries[0]
+            self.cursor.execute("DELETE FROM queue WHERE user = ?", [first[0]])
+            return first
 
-        first = users[0]
-        # also intentionally not handling edge cases (like user cant be removed from queue)
-        self.remove_user_from_queue(first)
-        return first
+    def next(self, queue_type: str | None = None) -> str | None:
+        entry = self.next_entry(queue_type)
+        return entry[0] if entry else None
 
     def is_user_a_ta(self, user_id: str) -> bool:
         with TA_DICT_PATH.open("r") as f:
@@ -130,35 +146,40 @@ class PrivateResponse(Response):
 # Action handlers
 
 
+def build_queues_string(entries: list[tuple[str, str]]) -> str:
+    sections = []
+    for queue_type, label in (("online", "Online"), ("inperson", "In-person")):
+        users = [user for user, kind in entries if kind == queue_type]
+        sections.append(f"{label} queue ({len(users)}):\n" + (build_queue_string(users) or "Empty."))
+    return "\n\n".join(sections)
+
+
 def handle_wait(req: Request) -> None:
     p = PersistentQueue()
-    position = p.get_postion_in_queue(req.requester_id)
-    size = p.get_num_users_in_queue()
-    msg: str = f"There are {size} people in the queue!"
-    if position is not None:
-        msg += f" There are {position} people in front of you."
+    entries = p.get_entries()
+    online = sum(kind == "online" for _, kind in entries)
+    msg = f"There are {len(entries)} people across both queues ({online} online, {len(entries) - online} in-person)!"
+    for position, (user, kind) in enumerate(entries):
+        if user == req.requester_id:
+            local_position = sum(other_kind == kind for _, other_kind in entries[:position])
+            label = "in-person" if kind == "inperson" else kind
+            msg += f" You are in the {label} queue, with {local_position} people ahead in that queue and {position} ahead across both queues."
+            break
     send_message(msg)
 
 
 def handle_passoff(req: Request) -> None:
+    if req.action == "passoff":
+        send_message("Please choose /passoff-online or /passoff-inperson to join a queue.")
+        return
+    queue_type = req.action.removeprefix("passoff-")
     p = PersistentQueue()
-
-    if p.is_user_in_queue(req.requester_id):
-        # they were already in the queue OR we couldn't add them for some reason
-        send_message(
-            "Couldn't add you to the queue; you're already in it! Patience grasshopper, we'll get to you soon."
-        )
-        return
-
-    position = p.add_user_to_queue(req.requester_id)
-
+    position = p.add_user_to_queue(req.requester_id, queue_type)
     if position is None:
-        send_message(
-            "Couldn't add you to the queue for some reason. Try again, and if the problem persists, contact a TA."
-        )
+        send_message("You're already in a passoff queue! Use /nevermind before joining a different queue.")
         return
-
-    send_message(f"You were added to the passoff queue. There are {position} people in front of you.", private=False)
+    label = "in-person" if queue_type == "inperson" else queue_type
+    send_message(f"You were added to the {label} passoff queue. There are {position} people in front of you in that queue.", private=False)
 
 
 def handle_nevermind(req: Request) -> None:
@@ -174,67 +195,51 @@ def handle_nevermind(req: Request) -> None:
     if not p.is_user_in_queue(user_id):
         send_message(f"Couldn't remove {pronoun} from the queue. Were {pronoun} in it?")
     else:
-        p.remove_user_from_queue(req.requester_id)
+        p.remove_user_from_queue(user_id)
         send_message(f"Successfully removed {pronoun} from the queue.")
 
 
 def handle_next(req: Request) -> None:
     p = PersistentQueue()
-    first = p.next()
-    if first is None:
-        send_message("Hmm, no one is in the queue, so nothing was done.")
+    queue_type = None if req.action == "next" else req.action.removeprefix("next-")
+    entry = p.next_entry(queue_type)
+    if entry is None:
+        label = "either queue" if queue_type is None else ("the in-person queue" if queue_type == "inperson" else "the online queue")
+        send_message(f"Hmm, no one is in {label}, so nothing was done.")
         return
-    else:
-        send_message(
-            f"You are up <@{first}>. Please come in, or DM <@{req.requester_id}> the link to your Zoom meeting.", private=False
-        )
-        return
+    first, kind = entry
+    instruction = f"Please DM <@{req.requester_id}> the link to your Zoom meeting." if kind == "online" else "Please come in."
+    send_message(f"You are up <@{first}>. {instruction}", private=False)
 
 
 def handle_queue(req: Request) -> None:
-    p = PersistentQueue()
-    users = p.get_users_in_queue()
-    if not users:
-        send_message("Ain't nobody here.")
-        return
-    else:
-        size = p.get_num_users_in_queue()
-        numbered_users_list = build_queue_string(users)
-        send_message(f"There are {size} people in the queue.\n{numbered_users_list}")
-        return
+    entries = PersistentQueue().get_entries()
+    send_message(f"There are {len(entries)} people across both queues.\n{build_queues_string(entries)}")
 
 
 def handle_clear_queue(req: Request) -> None:
     p = PersistentQueue()
-    users = p.get_users_in_queue()
-    if not users:
+    entries = p.get_entries()
+    if not entries:
         send_message("Ain't nobody here.")
         return
-
-    size = p.get_num_users_in_queue()
-    numbered_users_list = build_queue_string(users)
-
     p.clear_queue()
-
-    send_message(f"The following {size} people were cleared from the queue:\n{numbered_users_list}", private=False)
-    return
+    send_message(f"The following {len(entries)} people were cleared from both queues:\n{build_queues_string(entries)}", private=False)
 
 
 def handle_close_queue(req: Request) -> None:
     p = PersistentQueue()
-    users = p.get_users_in_queue()
-    numbered_users_list = build_queue_string(users)
+    entries = p.get_entries()
     send_message(
-        "Closing the queue for the night.\n\nSorry we couldn't get to everyone, "
-        "but don't worry--if you were on the queue an hour before the official closing time "
+        "Closing both queues for the night.\n\nSorry we couldn't get to everyone, "
+        "but don't worry--if you were on either queue an hour before the official closing time "
         "(according to the schedule, not this message), you can still get credit tomorrow "
         "as if you had passed off today."
-        f"\n\n{numbered_users_list}"
+        f"\n\n{build_queues_string(entries)}"
         "\n\n'Night, y'all!",
         private=False,
     )
     p.clear_queue()
-    return
 
 
 def handle_ta(req: Request) -> None:
@@ -282,12 +287,16 @@ def run_action(req: Request) -> None:
     student_handlers: dict[str, Callable[[Request], None]] = {
         "wait": handle_wait,
         "passoff": handle_passoff,
+        "passoff-online": handle_passoff,
+        "passoff-inperson": handle_passoff,
         "nevermind": handle_nevermind,
         "queue": handle_queue,
     }
 
     ta_only_handlers: dict[str, Callable[[Request], None]] = {
         "next": handle_next,
+        "next-online": handle_next,
+        "next-inperson": handle_next,
         "clearqueue": handle_clear_queue,
         "closequeue": handle_close_queue,
         "ta": handle_ta,
