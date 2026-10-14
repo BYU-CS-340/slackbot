@@ -277,6 +277,9 @@ def handle_bottest(req: Request) -> None:
     msg = f"action: '{req.action}'\nargs: {req.args}\nrequester_id: '{req.requester_id}'"
     send_message(msg)
 
+def handle_botter(req: Request) -> None:
+    send_message(f"Action: '{req.action}' was called by <@{req.requester_id}>")
+
 
 def run_action(req: Request) -> None:
     student_handlers: dict[str, Callable[[Request], None]] = {
@@ -292,6 +295,7 @@ def run_action(req: Request) -> None:
         "closequeue": handle_close_queue,
         "ta": handle_ta,
         "bottest": handle_bottest,
+        "botter": handle_botter,
     }
 
     if req.action in student_handlers:
