@@ -7,12 +7,20 @@ import json
 import os
 import urllib.request
 import urllib.error
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
+import logging
 
 import sqlite3
 
 
-TA_DICT_PATH = Path("./secrets/ta_slack_member_ids.json")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "db" / "queue.sqlite"
+TA_DICT_PATH = BASE_DIR / "secrets" / "ta_slack_member_ids.json"
+Response = dict[str, Any] | None
+
+
+class RequestError(Exception):
+    pass
 
 
 class IndividualPassoffRequired(Exception):
@@ -27,25 +35,31 @@ def build_queue_string(users: list[Any]) -> str:
 
 
 # Database, and folder it is in, must be writeable. This is why it is in a ./db folder.
-# There is no error handling here - Use self.lastErrorMsg() to get error messages when things break.
 
 
 class PersistentQueue:
     QUEUE_TYPES = ("online", "inperson")
 
-    def __init__(self) -> None:
-        db_name = "./db/queue.sqlite"
-        Path(db_name).parent.mkdir(parents=True, exist_ok=True)
-        db_exists = os.path.exists(db_name)
-        self.conn = sqlite3.connect(db_name)
+    def __init__(self, db_path: Path | None = None) -> None:
+        db_path = db_path or DB_PATH
+        db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Restrict existing databases too. Deploy with the web account as owner.
+        fd = os.open(db_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        os.chmod(db_path, 0o600)
+        self.conn = sqlite3.connect(db_path, timeout=1)
         self.cursor = self.conn.cursor()
-        if not db_exists:
-            os.chmod(db_name, 0o777)
-        self.create_tables()
-
-    def __del__(self) -> None:
-        if hasattr(self, "conn"):
+        try:
+            self.create_tables()
+        except Exception:
             self.conn.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.conn.close()
 
     def create_tables(self) -> None:
         # Serialize migration with joins/dequeues from other HTTP requests.
@@ -68,6 +82,49 @@ class PersistentQueue:
                 "CREATE TABLE IF NOT EXISTS consent_submissions(view_id TEXT PRIMARY KEY)"
             )
 
+            index_exists = self.cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'queue_user_unique'"
+            ).fetchone()
+            if not index_exists:
+                # Keep the oldest occurrence if a legacy database contains duplicates.
+                self.cursor.execute("DELETE FROM queue WHERE rowid NOT IN (SELECT MIN(rowid) FROM queue GROUP BY user)")
+                self.cursor.execute("CREATE UNIQUE INDEX queue_user_unique ON queue(user)")
+            self.cursor.execute("CREATE TABLE IF NOT EXISTS tas(user TEXT PRIMARY KEY, name TEXT NOT NULL)")
+            self.cursor.execute("CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY)")
+            imported = self.cursor.execute("SELECT 1 FROM migrations WHERE name = 'ta_json'").fetchone()
+            if not imported and TA_DICT_PATH.exists():
+                self._import_tas(TA_DICT_PATH)
+
+    def _import_tas(self, path: Path) -> None:
+        with path.open(encoding="utf-8") as source:
+            members = json.load(source)
+        if not isinstance(members, dict) or not all(
+            isinstance(user, str) and user and isinstance(name, str)
+            for user, name in members.items()
+        ):
+            raise ValueError("TA import must be an object mapping user IDs to names")
+        self.cursor.executemany(
+            "INSERT INTO tas(user, name) VALUES (?, ?) ON CONFLICT(user) DO UPDATE SET name = excluded.name",
+            members.items(),
+        )
+        self.cursor.execute("INSERT OR IGNORE INTO migrations VALUES ('ta_json')")
+
+    def import_tas(self, path: Path) -> None:
+        with self.conn:
+            self.cursor.execute("BEGIN IMMEDIATE")
+            self._import_tas(path)
+
+    def get_tas(self) -> dict[str, str]:
+        return dict(self.cursor.execute("SELECT user, name FROM tas ORDER BY user"))
+
+    def update_ta(self, user: str, name: str, add: bool) -> bool:
+        with self.conn:
+            if add:
+                self.cursor.execute("INSERT OR IGNORE INTO tas VALUES (?, ?)", [user, name])
+            else:
+                self.cursor.execute("DELETE FROM tas WHERE user = ?", [user])
+            return self.cursor.rowcount > 0
+
     def get_entries(self, queue_type: str | None = None) -> list[tuple[str, str]]:
         if queue_type is None:
             self.cursor.execute("SELECT user, queue_type FROM queue ORDER BY rowid")
@@ -81,7 +138,7 @@ class PersistentQueue:
     def get_users_in_queue(self, queue_type: str | None = None) -> list[str]:
         return [user for user, _ in self.get_entries(queue_type)]
 
-    def get_postion_in_queue(self, user_id: str, queue_type: str | None = None) -> int | None:
+    def get_position_in_queue(self, user_id: str, queue_type: str | None = None) -> int | None:
         users = self.get_users_in_queue(queue_type)
         return users.index(user_id) if user_id in users else None
 
@@ -109,15 +166,18 @@ class PersistentQueue:
                 "INSERT INTO queue (user, queue_type, group_ok) VALUES (?, ?, ?)",
                 [user_id, queue_type, int(group_ok and queue_type == "inperson")]
             )
-            return self.get_postion_in_queue(user_id, queue_type)
+            return self.get_position_in_queue(user_id, queue_type)
 
     def remove_user_from_queue(self, user_id: str) -> None:
         with self.conn:
             self.cursor.execute("DELETE FROM queue WHERE user = ?", [user_id])
 
-    def clear_queue(self) -> None:
+    def clear_queue(self) -> list[tuple[str, str]]:
         with self.conn:
+            self.cursor.execute("BEGIN IMMEDIATE")
+            entries = self.get_entries()
             self.cursor.execute("DELETE FROM queue")
+            return entries
 
     def next_entry(self, queue_type: str | None = None) -> tuple[str, str] | None:
         # rowid orders all joins, including ties in wall-clock time. Taking the
@@ -158,9 +218,7 @@ class PersistentQueue:
             return users
 
     def is_user_a_ta(self, user_id: str) -> bool:
-        with TA_DICT_PATH.open("r") as f:
-            ta_user_ids = json.load(f)
-        return user_id in ta_user_ids
+        return self.cursor.execute("SELECT 1 FROM tas WHERE user = ?", [user_id]).fetchone() is not None
 
 
 class Request:
@@ -172,31 +230,13 @@ class Request:
         self.trigger_id = trigger_id
 
 
-class Response:
-    def __init__(self, text: str) -> None:
-        self.text: str = text
-
-
-class ChannelResponse(Response):
-    response_type = "in_channel"
-
-    def __init__(self, text: str) -> None:
-        self.text: str = text
-
-
-class PrivateResponse(Response):
-    def __init__(self, text: str) -> None:
-        super().__init__(text)
-
-
 # Action handlers
 
 
-def open_consent_modal(req: Request) -> None:
+def open_consent_modal(req: Request) -> Response:
     token = os.environ.get("SLACK_BOT_TOKEN")
     if not token or not req.trigger_id:
-        send_message("Could not open the join form. Please contact a TA; you have not joined the queue.")
-        return
+        return message_response("Could not open the join form. Please contact a TA; you have not joined the queue.")
     view = {
         "type": "modal", "callback_id": "inperson_consent",
         "title": {"type": "plain_text", "text": "In-person passoff"},
@@ -226,12 +266,12 @@ def open_consent_modal(req: Request) -> None:
         if not result.get("ok"):
             raise ValueError("Slack rejected modal")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        send_message("Could not open the join form. Please try /passoff-inperson again. "
+        return message_response("Could not open the join form. Please try /passoff-inperson again. "
                      "You have not joined the queue.")
-        return
 
 
-def handle_interaction(payload: dict[str, Any]) -> None:
+
+def handle_interaction(payload: dict[str, Any], p: PersistentQueue) -> Response:
     view = payload.get("view", {})
     if payload.get("type") != "view_submission" or view.get("callback_id") != "inperson_consent":
         return
@@ -239,15 +279,14 @@ def handle_interaction(payload: dict[str, Any]) -> None:
                 .get("choice", {}).get("selected_option") or {})
     choice = selected.get("value")
     if choice not in ("yes", "no"):
-        print(json.dumps({"response_action": "errors", "errors": {
+        return {"response_action": "errors", "errors": {
             "group_consent": "Please choose Yes or No before joining."
-        }}))
-        return
+        }}
     user_id = payload.get("user", {}).get("id")
     view_id = view.get("id")
     if not isinstance(user_id, str) or not user_id or not isinstance(view_id, str) or not view_id:
         return
-    position = PersistentQueue().add_user_to_queue(
+    position = p.add_user_to_queue(
         user_id, "inperson", group_ok=choice == "yes", view_id=view_id
     )
     if position is None:
@@ -256,11 +295,11 @@ def handle_interaction(payload: dict[str, Any]) -> None:
         preference = "Group passoff is OK." if choice == "yes" else "Individual passoff only."
         message = (f"You joined the in-person queue with {position} people ahead. "
                    f"{preference} Use /wait to check your place or /nevermind to leave.")
-    print(json.dumps({"response_action": "update", "view": {
+    return {"response_action": "update", "view": {
         "type": "modal", "title": {"type": "plain_text", "text": "Passoff queue"},
         "close": {"type": "plain_text", "text": "Done"},
         "blocks": [{"type": "section", "text": {"type": "plain_text", "text": message}}],
-    }}))
+    }}
 
 
 def build_queues_string(entries: list[tuple[str, str]]) -> str:
@@ -271,8 +310,7 @@ def build_queues_string(entries: list[tuple[str, str]]) -> str:
     return "\n\n".join(sections)
 
 
-def handle_wait(req: Request) -> None:
-    p = PersistentQueue()
+def handle_wait(req: Request, p: PersistentQueue) -> Response:
     entries = p.get_entries()
     online = sum(kind == "online" for _, kind in entries)
     msg = f"There are {len(entries)} people across both queues ({online} online, {len(entries) - online} in-person)!"
@@ -282,104 +320,87 @@ def handle_wait(req: Request) -> None:
             label = "in-person" if kind == "inperson" else kind
             msg += f" You are in the {label} queue, with {local_position} people ahead in that queue and {position} ahead across both queues."
             break
-    send_message(msg)
+    return message_response(msg)
 
 
-def handle_passoff(req: Request) -> None:
+def handle_passoff(req: Request, p: PersistentQueue) -> Response:
     if req.action == "passoff":
-        send_message("Please choose /passoff-online or /passoff-inperson to join a queue.")
-        return
+        return message_response("Please choose /passoff-online or /passoff-inperson to join a queue.")
     queue_type = req.action.removeprefix("passoff-")
-    p = PersistentQueue()
     if queue_type == "inperson":
         if p.is_user_in_queue(req.requester_id):
-            send_message("You're already in a passoff queue! Use /nevermind before joining a different queue.")
-            return
-        open_consent_modal(req)
-        return
+            return message_response("You're already in a passoff queue! Use /nevermind before joining a different queue.")
+        return open_consent_modal(req)
     position = p.add_user_to_queue(req.requester_id, queue_type)
     if position is None:
-        send_message("You're already in a passoff queue! Use /nevermind before joining a different queue.")
-        return
+        return message_response("You're already in a passoff queue! Use /nevermind before joining a different queue.")
     label = "in-person" if queue_type == "inperson" else queue_type
-    send_message(f"You were added to the {label} passoff queue. There are {position} people in front of you in that queue.", private=False)
+    return message_response(f"You were added to the {label} passoff queue. There are {position} people in front of you in that queue.", private=False)
 
 
-def handle_nevermind(req: Request) -> None:
+def handle_nevermind(req: Request, p: PersistentQueue) -> Response:
     if req.args:
-        require_ta_or_halt(req, "Students can only remove themselves, by using /nevermind with no arguments.")
+        require_ta_or_halt(req, p, "Students can only remove themselves, by using /nevermind with no arguments.")
         user_id, _ = parse_arg_as_user(req.args[0])
         pronoun = "they"
     else:
         user_id = req.requester_id
         pronoun = "you"
 
-    p = PersistentQueue()
     if not p.is_user_in_queue(user_id):
-        send_message(f"Couldn't remove {pronoun} from the queue. Were {pronoun} in it?")
+        return message_response(f"Couldn't remove {pronoun} from the queue. Were {pronoun} in it?")
     else:
         p.remove_user_from_queue(user_id)
-        send_message(f"Successfully removed {pronoun} from the queue.")
+        return message_response(f"Successfully removed {pronoun} from the queue.")
 
 
-def handle_next(req: Request) -> None:
-    p = PersistentQueue()
+def handle_next(req: Request, p: PersistentQueue) -> Response:
     queue_type = None if req.action == "next" else req.action.removeprefix("next-")
     entry = p.next_entry(queue_type)
     if entry is None:
         label = "either queue" if queue_type is None else ("the in-person queue" if queue_type == "inperson" else "the online queue")
-        send_message(f"Hmm, no one is in {label}, so nothing was done.")
-        return
+        return message_response(f"Hmm, no one is in {label}, so nothing was done.")
     first, kind = entry
     instruction = f"Please DM <@{req.requester_id}> the link to your Zoom meeting." if kind == "online" else "Please come in."
-    send_message(f"You are up <@{first}>. {instruction}", private=False)
+    return message_response(f"You are up <@{first}>. {instruction}", private=False)
 
 
-def handle_next_group(req: Request) -> None:
+def handle_next_group(req: Request, p: PersistentQueue) -> Response:
     usage = "Usage: /next-group <number>. Enter a whole number from 1 to 5, for example /next-group 3."
     if len(req.args) != 1 or not re.fullmatch(r"[0-9]+", req.args[0]):
-        send_message(usage)
-        return
+        return message_response(usage)
     try:
         count = int(req.args[0])
     except ValueError:
-        send_message(usage)
-        return
+        return message_response(usage)
     if not 1 <= count <= 5:
-        send_message(usage)
-        return
+        return message_response(usage)
     try:
-        users = PersistentQueue().next_group(count)
+        users = p.next_group(count)
     except IndividualPassoffRequired:
-        send_message("The next student needs an individual passoff. Use /next-inperson "
+        return message_response("The next student needs an individual passoff. Use /next-inperson "
                      "to call them before starting another group. No one was removed.")
-        return
     if not users:
-        send_message("Hmm, no one is in the in-person queue, so nothing was done.")
-        return
+        return message_response("Hmm, no one is in the in-person queue, so nothing was done.")
     mentions = ", ".join(f"<@{user}>" for user in users)
-    send_message(f"You are up {mentions}. Please come in.", private=False)
+    return message_response(f"You are up {mentions}. Please come in.", private=False)
 
 
-def handle_queue(req: Request) -> None:
-    entries = PersistentQueue().get_entries()
-    send_message(f"There are {len(entries)} people across both queues.\n{build_queues_string(entries)}")
-
-
-def handle_clear_queue(req: Request) -> None:
-    p = PersistentQueue()
+def handle_queue(req: Request, p: PersistentQueue) -> Response:
     entries = p.get_entries()
+    return message_response(f"There are {len(entries)} people across both queues.\n{build_queues_string(entries)}")
+
+
+def handle_clear_queue(req: Request, p: PersistentQueue) -> Response:
+    entries = p.clear_queue()
     if not entries:
-        send_message("Ain't nobody here.")
-        return
-    p.clear_queue()
-    send_message(f"The following {len(entries)} people were cleared from both queues:\n{build_queues_string(entries)}", private=False)
+        return message_response("Ain't nobody here.")
+    return message_response(f"The following {len(entries)} people were cleared from both queues:\n{build_queues_string(entries)}", private=False)
 
 
-def handle_close_queue(req: Request) -> None:
-    p = PersistentQueue()
-    entries = p.get_entries()
-    send_message(
+def handle_close_queue(req: Request, p: PersistentQueue) -> Response:
+    entries = p.clear_queue()
+    return message_response(
         "Closing both queues for the night.\n\nSorry we couldn't get to everyone, "
         "but don't worry--if you were on either queue an hour before the official closing time "
         "(according to the schedule, not this message), you can still get credit tomorrow "
@@ -388,52 +409,28 @@ def handle_close_queue(req: Request) -> None:
         "\n\n'Night, y'all!",
         private=False,
     )
-    p.clear_queue()
 
 
-def handle_ta(req: Request) -> None:
-    with TA_DICT_PATH.open("r") as f:
-        ta_dict = json.load(f)
-
-    if len(req.args) == 0:
-        ta_list_string = "\n".join([f"<@{ta_dict[ta_id]}> ({ta_id})" for ta_id in ta_dict])
-        send_message(f"Current TA list:\n{ta_list_string}")
-        return
-    if len(req.args) != 2:
-        send_error("Invalid usage. This command needs 0 or 2 arguments.")
-        return
-
-    subcmd = req.args[0]
-    specified_user_id, specified_user_name = parse_arg_as_user(req.args[1])
-
-    if subcmd == "add":
-        if specified_user_id in ta_dict:
-            send_message("User is already a TA.")
-            return
-        ta_dict[specified_user_id] = specified_user_name
-
-    elif subcmd == "rmv":
-        if specified_user_id not in ta_dict:
-            send_message("User is not currently a TA.")
-            return
-        del ta_dict[specified_user_id]
-
-    else:
-        send_error("Invalid usage. Valid subcommands are '/ta add <user>' and '/ta rmv <user>'")
-        return
-
-    with TA_DICT_PATH.open("w") as f:
-        json.dump(ta_dict, f)
-    send_message("Updated TA list successfully.")
+def handle_ta(req: Request, p: PersistentQueue) -> Response:
+    if not req.args:
+        listing = "\n".join(f"<@{user}> ({name})" for user, name in p.get_tas().items())
+        return message_response(f"Current TA list:\n{listing}")
+    if len(req.args) != 2 or req.args[0] not in ("add", "rmv"):
+        raise RequestError("Use /ta, /ta add @user, or /ta rmv @user.")
+    user, name = parse_arg_as_user(req.args[1])
+    add = req.args[0] == "add"
+    if not p.update_ta(user, name, add):
+        return message_response("User is already a TA." if add else "User is not currently a TA.")
+    return message_response("Updated TA list successfully.")
 
 
-def handle_bottest(req: Request) -> None:
+def handle_bottest(req: Request, p: PersistentQueue) -> Response:
     msg = f"action: '{req.action}'\nargs: {req.args}\nrequester_id: '{req.requester_id}'"
-    send_message(msg)
+    return message_response(msg)
 
 
-def run_action(req: Request) -> None:
-    student_handlers: dict[str, Callable[[Request], None]] = {
+def run_action(req: Request, p: PersistentQueue) -> Response:
+    student_handlers: dict[str, Callable[[Request, PersistentQueue], Response]] = {
         "wait": handle_wait,
         "passoff": handle_passoff,
         "passoff-online": handle_passoff,
@@ -442,7 +439,7 @@ def run_action(req: Request) -> None:
         "queue": handle_queue,
     }
 
-    ta_only_handlers: dict[str, Callable[[Request], None]] = {
+    ta_only_handlers: dict[str, Callable[[Request, PersistentQueue], Response]] = {
         "next": handle_next,
         "next-online": handle_next,
         "next-inperson": handle_next,
@@ -455,41 +452,34 @@ def run_action(req: Request) -> None:
 
     if req.action in student_handlers:
         handler = student_handlers[req.action]
-        handler(req)
-        return
+        return handler(req, p)
 
     if req.action in ta_only_handlers:
-        require_ta_or_halt(req)
+        require_ta_or_halt(req, p)
         handler = ta_only_handlers[req.action]
-        handler(req)
-        return
+        return handler(req, p)
 
     send_error(f"Unrecognized action: '{req.action}'. Args were '{req.args}'")
 
 
-def require_ta_or_halt(req: Request, msg: str = "") -> None:
-        p = PersistentQueue()
-        if not p.is_user_a_ta(req.requester_id):
-            send_message("TA command only, sorry. " + msg)
-            sys.exit()
+def require_ta_or_halt(req: Request, p: PersistentQueue, msg: str = "") -> None:
+    if not p.is_user_a_ta(req.requester_id):
+        raise RequestError("TA command only, sorry. " + msg)
 
 
-def send_message(msg: str, private: bool = True) -> None:
-    res = {"text": msg} if private else {"text": msg, "response_type": "in_channel"}
-    res_str = json.dumps(res)
-    print(res_str)
+def message_response(msg: str, private: bool = True) -> dict[str, Any]:
+    return {"text": msg} if private else {"text": msg, "response_type": "in_channel"}
 
 
-def send_error(msg: str) -> None:
-    send_message(f"Error (please contact a TA!): {msg}")
-    sys.exit(1)
+def send_error(msg: str) -> NoReturn:
+    raise RequestError(msg)
 
 
 def parse_arg_as_user(raw_arg: str) -> tuple[str, str]:
-    pattern = re.compile(r"<@(.*)\|(.*)>")
-    match = pattern.search(raw_arg)
+    match = re.fullmatch(r"<@([A-Za-z0-9]+)(?:\|([^>]+))?>", raw_arg)
     if match:
         user_id, user_name = match.groups()
+        user_name = user_name or user_id
     else:
         send_error(f"Invalid user argument '{raw_arg}'. Does that user not exist, or did you forget to @-mention them?")
     return user_id, user_name
@@ -499,8 +489,7 @@ def extract_info(http_post_data: Any) -> Request:
     action = action[1:]  # Remove leading "/" character
 
     args_str = require_field("text", http_post_data)
-    args = args_str.strip().split(" ")  # replace "arg1 arg2" with ["arg1", "arg2"],
-    args = [a for a in args if a != ""]  # filter out empty-string args
+    args = args_str.split()
 
     requester_id = require_field("user_id", http_post_data)
 
@@ -508,13 +497,11 @@ def extract_info(http_post_data: Any) -> Request:
 
 
 def require_field(field: str, data: dict[str, Any], err_msg: str = "") -> str:
-    if field not in data:
+    if not isinstance(data, dict) or field not in data:
         send_error(f"Failed to parse HTTP request: Could not find field '{field}'. {err_msg}")
-        exit(1)
     value = data[field]
     if not isinstance(value, str):
         send_error(f"Failed to parse HTTP request: Field '{field}' is not a string.")
-        exit(1)
     return value
 
 
@@ -531,14 +518,46 @@ def parse_args(args: list[str]) -> tuple[Any, Any]:
     return http_get_data, http_post_data
 
 
-def run(argv: list[str]) -> None:
-    http_get_data, http_post_data = parse_args(argv)
-    if "payload" in http_post_data:
-        handle_interaction(json.loads(http_post_data["payload"]))
-        return
-    request = extract_info(http_post_data)
-    run_action(request)
+def run(argv: list[str]) -> Response:
+    if argv[1:] == ["--stdin"]:
+        try:
+            post = json.load(sys.stdin)
+        except ValueError:
+            raise RequestError("Invalid request data.")
+    else:
+        _, post = parse_args(argv)
+    if not isinstance(post, dict):
+        raise RequestError("Invalid request data.")
+    with PersistentQueue() as queue:
+        if "payload" in post:
+            try:
+                payload = json.loads(post["payload"])
+            except (TypeError, ValueError):
+                raise RequestError("Invalid interaction payload.")
+            if not isinstance(payload, dict):
+                raise RequestError("Invalid interaction payload.")
+            return handle_interaction(payload, queue)
+        return run_action(extract_info(post), queue)
+
+
+def main(argv: list[str]) -> int:
+    try:
+        if len(argv) == 3 and argv[1] == "--import-tas":
+            with PersistentQueue() as queue:
+                queue.import_tas(Path(argv[2]).resolve())
+            response = message_response("TA accounts imported successfully.")
+        else:
+            response = run(argv)
+    except RequestError as error:
+        response = message_response(str(error))
+    except Exception:
+        logging.exception("Slack request failed")
+        print(json.dumps(message_response("The bot could not complete this request. Please contact a TA.")))
+        return 1
+    if response is not None:
+        print(json.dumps(response))
+    return 0
 
 
 if __name__ == "__main__":
-    run(sys.argv)
+    sys.exit(main(sys.argv))

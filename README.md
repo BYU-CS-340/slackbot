@@ -54,14 +54,34 @@ Production is hosted on the CS lab machines at `/users/groups/cs340ta/public_htm
 
 Commit and push from a local checkout, then pull changes on the server. Avoid committing from the lab machines because of repository permissions.
 
-The server needs PHP, Python 3.10 or newer with SQLite support, and write access to both `db/` and its database file. No third-party Python packages are required. Back up the database before deployment. Schema updates run automatically, preserving queue order. Legacy rows without a queue type become in-person entries; existing students without recorded consent default to individual-only passoff.
+The server needs PHP 7.4 or newer with `proc_open` enabled, `python3` (Python 3.10 or newer) with SQLite support, and write access to both `db/` and its database file. No third-party Python packages are required. Paths are resolved relative to `slackbot.py`, regardless of the working directory. PHP passes authenticated request data through stdin and logs Python errors server-side instead of including them in Slack responses.
 
-TA access is stored in `secrets/ta_slack_member_ids.json`. If nobody has TA access, restore it from `secrets/backup_slack_member_ids.json` on the server, then use `/ta add` to grant access as needed.
+Before deploying, back up the database and TA JSON file. Ensure the account running Python owns the database: the bot applies owner-only `0600` permissions, including to an existing database. New database directories use `0700`; have the lab administrators restrict existing directories and deny HTTP access to `db/` and `secrets/`. Do not use world-writable permissions to resolve access errors.
+
+Schema updates run automatically. Legacy rows without a queue type become in-person entries; existing students without recorded consent default to individual-only passoff. A unique constraint prevents a student from joining both queues. If a legacy database contains duplicates, migration keeps that student's oldest entry.
+
+TA accounts are stored in the same SQLite database. On first migration, `secrets/ta_slack_member_ids.json` is imported if present. Subsequent `/ta` updates use database transactions; editing the JSON file no longer changes access. An absent seed file grants nobody access. To recover access or explicitly import accounts, run this as the database owner from the project directory:
+
+```sh
+python3 slackbot.py --import-tas secrets/backup_slack_member_ids.json
+```
+
+This adds or updates the supplied accounts without removing existing TAs. Back up the database to preserve both queue and TA data.
+
+## Testing
+
+```sh
+python -B -m unittest -v
+```
+
+Tests use temporary databases and mocked Slack calls. Coverage includes group consent and fairness, the 1–5 limit, TA permissions and migration, concurrent TA updates and queue operations, duplicate prevention, and error responses. PHP syntax and signature tests run when `php` is installed; Unix file-permission checks are skipped on Windows.
+
+Run the suite on the lab server as well, then test both consent choices and `/next-group` in Slack. Verify the signing secret is configured before deploying: unsigned requests must be rejected. Signature verification follows [Slack's request verification procedure](https://docs.slack.dev/authentication/verifying-requests-from-slack/).
 
 ## Development
 
-`run()` routes slash commands to `run_action()` and modal submissions to `handle_interaction()`. To add a command, register its name without the leading slash in the student or TA-only handler dictionary. Handlers accept a `Request` and return `None`.
+`run()` routes slash commands to `run_action()` and modal submissions to `handle_interaction()`. To add a command, register its name without the leading slash in the student or TA-only handler dictionary. Command handlers accept a `Request` and the request's `PersistentQueue`, and return a response dictionary or `None` for an empty acknowledgement. The entry point serializes the response once.
 
-The request exposes `action`, `args`, `requester_id`, and `trigger_id`. Use `PersistentQueue` for database access and `parse_arg_as_user()` for user mentions. Queue selection and removal happen in a single transaction to prevent concurrent TAs from calling the same student.
+The request exposes `action`, `args`, `requester_id`, and `trigger_id`. Use `PersistentQueue` as a context manager for database access and `parse_arg_as_user()` for user mentions. Queue selection and removal happen in a single transaction to prevent concurrent TAs from calling the same student. Clearing returns the exact entries removed in that transaction, so concurrent joins cannot disappear without appearing in the announcement.
 
-Use `send_message()` for a private command response or `send_message(..., private=False)` for a channel announcement. Mention users as `<@USER_ID>`. Emit only one JSON response per request; modal submissions use Slack's response-action format.
+Return `message_response()` for a private command response or `message_response(..., private=False)` for a channel announcement. Mention users as `<@USER_ID>`. Raise `RequestError` for a user-facing validation message. Unexpected errors are logged and produce a generic failure response; modal submissions use Slack's response-action format.
