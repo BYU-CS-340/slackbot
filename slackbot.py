@@ -5,12 +5,18 @@ import re
 import sys
 import json
 import os
+import urllib.request
+import urllib.error
 from typing import Any, Callable
 
 import sqlite3
 
 
 TA_DICT_PATH = Path("./secrets/ta_slack_member_ids.json")
+
+
+class IndividualPassoffRequired(Exception):
+    pass
 
 
 # Util functions
@@ -53,6 +59,14 @@ class PersistentQueue:
                     "ALTER TABLE queue ADD COLUMN queue_type TEXT NOT NULL "
                     "DEFAULT 'inperson' CHECK(queue_type IN ('online', 'inperson'))"
                 )
+            if "group_ok" not in columns:
+                self.cursor.execute(
+                    "ALTER TABLE queue ADD COLUMN group_ok INTEGER NOT NULL "
+                    "DEFAULT 0 CHECK(group_ok IN (0, 1))"
+                )
+            self.cursor.execute(
+                "CREATE TABLE IF NOT EXISTS consent_submissions(view_id TEXT PRIMARY KEY)"
+            )
 
     def get_entries(self, queue_type: str | None = None) -> list[tuple[str, str]]:
         if queue_type is None:
@@ -77,15 +91,23 @@ class PersistentQueue:
     def is_user_in_queue(self, user_id: str) -> bool:
         return user_id in self.get_users_in_queue()
 
-    def add_user_to_queue(self, user_id: str, queue_type: str = "inperson") -> int | None:
+    def add_user_to_queue(self, user_id: str, queue_type: str = "inperson",
+                          group_ok: bool = False, view_id: str | None = None) -> int | None:
         if queue_type not in self.QUEUE_TYPES:
             raise ValueError(f"Unknown queue: {queue_type}")
         with self.conn:
             self.cursor.execute("BEGIN IMMEDIATE")
+            if view_id is not None:
+                self.cursor.execute(
+                    "INSERT OR IGNORE INTO consent_submissions(view_id) VALUES (?)", [view_id]
+                )
+                if self.cursor.rowcount == 0:
+                    return None
             if self.is_user_in_queue(user_id):
                 return None
             self.cursor.execute(
-                "INSERT INTO queue (user, queue_type) VALUES (?, ?)", [user_id, queue_type]
+                "INSERT INTO queue (user, queue_type, group_ok) VALUES (?, ?, ?)",
+                [user_id, queue_type, int(group_ok and queue_type == "inperson")]
             )
             return self.get_postion_in_queue(user_id, queue_type)
 
@@ -113,6 +135,28 @@ class PersistentQueue:
         entry = self.next_entry(queue_type)
         return entry[0] if entry else None
 
+    def next_group(self, count: int) -> list[str]:
+        if type(count) is not int or not 1 <= count <= 5:
+            raise ValueError("Group size must be a whole number from 1 to 5")
+        with self.conn:
+            self.cursor.execute("BEGIN IMMEDIATE")
+            entries = self.cursor.execute(
+                "SELECT user, group_ok FROM queue WHERE queue_type = 'inperson' ORDER BY rowid"
+            ).fetchall()
+            if entries and not entries[0][1]:
+                raise IndividualPassoffRequired(entries[0][0])
+            users = []
+            for user, group_ok in entries:
+                # Never let a group overtake someone waiting for individual help.
+                if not group_ok or len(users) == count:
+                    break
+                users.append(user)
+            self.cursor.executemany(
+                "DELETE FROM queue WHERE user = ? AND queue_type = 'inperson'",
+                [(user,) for user in users],
+            )
+            return users
+
     def is_user_a_ta(self, user_id: str) -> bool:
         with TA_DICT_PATH.open("r") as f:
             ta_user_ids = json.load(f)
@@ -120,10 +164,12 @@ class PersistentQueue:
 
 
 class Request:
-    def __init__(self, action: str, args: list[str], requester_id: str) -> None:
+    def __init__(self, action: str, args: list[str], requester_id: str,
+                 trigger_id: str = "") -> None:
         self.action: str = action
         self.args: list[str] = args
         self.requester_id: str = requester_id
+        self.trigger_id = trigger_id
 
 
 class Response:
@@ -144,6 +190,77 @@ class PrivateResponse(Response):
 
 
 # Action handlers
+
+
+def open_consent_modal(req: Request) -> None:
+    token = os.environ.get("SLACK_BOT_TOKEN")
+    if not token or not req.trigger_id:
+        send_message("Could not open the join form. Please contact a TA; you have not joined the queue.")
+        return
+    view = {
+        "type": "modal", "callback_id": "inperson_consent",
+        "title": {"type": "plain_text", "text": "In-person passoff"},
+        "submit": {"type": "plain_text", "text": "Join queue"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text":
+                "Are you comfortable doing your passoff with a group? Choose either option. "
+                "Your choice will not affect your place in the queue."}},
+            {"type": "input", "block_id": "group_consent",
+             "label": {"type": "plain_text", "text": "Group passoff preference"},
+             "element": {"type": "radio_buttons", "action_id": "choice", "options": [
+                 {"text": {"type": "plain_text", "text": "Yes, a group is fine"}, "value": "yes"},
+                 {"text": {"type": "plain_text", "text": "No, individual passoff please"}, "value": "no"},
+             ]}},
+        ],
+    }
+    request = urllib.request.Request(
+        "https://slack.com/api/views.open",
+        data=json.dumps({"trigger_id": req.trigger_id, "view": view}).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            result = json.load(response)
+        if not result.get("ok"):
+            raise ValueError("Slack rejected modal")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        send_message("Could not open the join form. Please try /passoff-inperson again. "
+                     "You have not joined the queue.")
+        return
+
+
+def handle_interaction(payload: dict[str, Any]) -> None:
+    view = payload.get("view", {})
+    if payload.get("type") != "view_submission" or view.get("callback_id") != "inperson_consent":
+        return
+    selected = (view.get("state", {}).get("values", {}).get("group_consent", {})
+                .get("choice", {}).get("selected_option") or {})
+    choice = selected.get("value")
+    if choice not in ("yes", "no"):
+        print(json.dumps({"response_action": "errors", "errors": {
+            "group_consent": "Please choose Yes or No before joining."
+        }}))
+        return
+    user_id = payload.get("user", {}).get("id")
+    view_id = view.get("id")
+    if not isinstance(user_id, str) or not user_id or not isinstance(view_id, str) or not view_id:
+        return
+    position = PersistentQueue().add_user_to_queue(
+        user_id, "inperson", group_ok=choice == "yes", view_id=view_id
+    )
+    if position is None:
+        message = "This form was already processed or you are already in a queue. Use /wait to check your place."
+    else:
+        preference = "Group passoff is OK." if choice == "yes" else "Individual passoff only."
+        message = (f"You joined the in-person queue with {position} people ahead. "
+                   f"{preference} Use /wait to check your place or /nevermind to leave.")
+    print(json.dumps({"response_action": "update", "view": {
+        "type": "modal", "title": {"type": "plain_text", "text": "Passoff queue"},
+        "close": {"type": "plain_text", "text": "Done"},
+        "blocks": [{"type": "section", "text": {"type": "plain_text", "text": message}}],
+    }}))
 
 
 def build_queues_string(entries: list[tuple[str, str]]) -> str:
@@ -174,6 +291,12 @@ def handle_passoff(req: Request) -> None:
         return
     queue_type = req.action.removeprefix("passoff-")
     p = PersistentQueue()
+    if queue_type == "inperson":
+        if p.is_user_in_queue(req.requester_id):
+            send_message("You're already in a passoff queue! Use /nevermind before joining a different queue.")
+            return
+        open_consent_modal(req)
+        return
     position = p.add_user_to_queue(req.requester_id, queue_type)
     if position is None:
         send_message("You're already in a passoff queue! Use /nevermind before joining a different queue.")
@@ -210,6 +333,32 @@ def handle_next(req: Request) -> None:
     first, kind = entry
     instruction = f"Please DM <@{req.requester_id}> the link to your Zoom meeting." if kind == "online" else "Please come in."
     send_message(f"You are up <@{first}>. {instruction}", private=False)
+
+
+def handle_next_group(req: Request) -> None:
+    usage = "Usage: /next-group <number>. Enter a whole number from 1 to 5, for example /next-group 3."
+    if len(req.args) != 1 or not re.fullmatch(r"[0-9]+", req.args[0]):
+        send_message(usage)
+        return
+    try:
+        count = int(req.args[0])
+    except ValueError:
+        send_message(usage)
+        return
+    if not 1 <= count <= 5:
+        send_message(usage)
+        return
+    try:
+        users = PersistentQueue().next_group(count)
+    except IndividualPassoffRequired:
+        send_message("The next student needs an individual passoff. Use /next-inperson "
+                     "to call them before starting another group. No one was removed.")
+        return
+    if not users:
+        send_message("Hmm, no one is in the in-person queue, so nothing was done.")
+        return
+    mentions = ", ".join(f"<@{user}>" for user in users)
+    send_message(f"You are up {mentions}. Please come in.", private=False)
 
 
 def handle_queue(req: Request) -> None:
@@ -297,6 +446,7 @@ def run_action(req: Request) -> None:
         "next": handle_next,
         "next-online": handle_next,
         "next-inperson": handle_next,
+        "next-group": handle_next_group,
         "clearqueue": handle_clear_queue,
         "closequeue": handle_close_queue,
         "ta": handle_ta,
@@ -354,7 +504,7 @@ def extract_info(http_post_data: Any) -> Request:
 
     requester_id = require_field("user_id", http_post_data)
 
-    return Request(action, args, requester_id)
+    return Request(action, args, requester_id, http_post_data.get("trigger_id", ""))
 
 
 def require_field(field: str, data: dict[str, Any], err_msg: str = "") -> str:
@@ -383,6 +533,9 @@ def parse_args(args: list[str]) -> tuple[Any, Any]:
 
 def run(argv: list[str]) -> None:
     http_get_data, http_post_data = parse_args(argv)
+    if "payload" in http_post_data:
+        handle_interaction(json.loads(http_post_data["payload"]))
+        return
     request = extract_info(http_post_data)
     run_action(request)
 
