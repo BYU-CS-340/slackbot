@@ -1,40 +1,67 @@
-# CS340 Slack bot
+﻿# CS340 Slack bot
 
-This repo contains the application code for `ABSOLUTELY USELESS TWEETER BOT`, the Slack bot for CS 340. It's just a few custom slash commands, along with a SQLite DB to store the current queue.
+TweeterBot manages online and in-person passoff queues for CS340. `index.php` verifies incoming Slack requests and forwards them to `slackbot.py`. Queue data is stored in `db/queue.sqlite`.
 
-The Slack bot is currently a PHP server, but that is being phased out in favor of Python. So far, all logic and functionality has been moved into `slackbot.py`. The server entry point is still `index.php`, but all it does is call slackbot.py with the HTTP request data.
+## Student commands
 
-## Updating the list of TAs
+| Command | Action |
+| --- | --- |
+| `/passoff-online` | Join the online queue. |
+| `/passoff-inperson` | Choose whether group passoff is OK in a popup, then join the in-person queue. |
+| `/passoff` | Show the two join commands. |
+| `/wait` | Show queue sizes and your position. |
+| `/queue` | List both queues. |
+| `/nevermind` | Leave your queue. |
 
-To add or remove TAs, use the `/ta add @Alice` and `/ta rmv @Bob` commands. `/ta` with no arguments prints the current list of TAs.
+Students can join only one queue at a time. In-person queue order starts when the form is submitted; canceling does not join. The form requires an explicit Yes or No and confirms the join privately. To switch queues or change your preference, leave and rejoin, which resets your place. Positions count people ahead, starting at zero.
 
-Obviously this command requires TA privileges. If you get locked out because no one has TA access, log into the slack bot as described [below](#modifying-the-slack-bot), and copy the contents of `secrets/backup_slack_member_ids.json` into `secrets/ta_slack_member_ids.json`. This will give TA privileges to Dr. Rodham and Dr. Wilkerson, so they can add everyone else.
+## TA commands
 
-## Modifying the Slack bot
+| Command | Action |
+| --- | --- |
+| `/next` | Call the longest-waiting student across both queues. |
+| `/next-online` | Call the next online student and ask them to DM the TA a Zoom link. |
+| `/next-inperson` | Call the next in-person student individually. |
+| `/next-group <number>` | Call up to that many consenting in-person students together. |
+| `/nevermind @student` | Remove a student from either queue. |
+| `/clearqueue` | Clear both queues and announce who was removed. |
+| `/closequeue` | Announce closing and clear both queues. New joins remain enabled. |
+| `/ta` | List TAs. |
+| `/ta add @student` | Grant TA access. |
+| `/ta rmv @student` | Remove TA access. |
+| `/bottest` | Show the parsed command, arguments, and requester ID. |
 
-TweeterBot's production code is hosted on the lab machines. To access the bot directly, ssh into one of the CS department lab machines, then cd into `/users/groups/cs340ta/public_html/slack`. If you don't have permission, the OIT guys (first floor of the TMCB) can give you access. **Warning**: If you're modifying the code, don't commit to this repo directly from the lab machines--you'll likely run into git permissions issues. Instead, clone the repo locally and push from there, then log into the lab machines to pull your changes. (Editing the lab machine code is fine for experimentation, just don't commit from there.)
+### Group consent and fairness
 
-To add or remove a slash command, you'll need to access the Slack App itself. Go to [api.slack.com/apps](https://api.slack.com/apps); select TWEETER BOT (if you don't see it, ask Dr. Rodham for "Workspace Admin" privileges for the Slack workspace); and click "Slash Commands" on the left sidebar. When you create a new command, the Request URL should be the same as the other commands. If your command will take a user as an argument (like `/ta add @Charlie`), check the "Escape channels, users, and links" box.
+`/next-group 3` calls and removes up to three students who agreed to group passoff. The number must be a whole number from 1 to 5. Values outside that range and decimals are rejected without changing the queue. The online queue is unaffected.
 
-### The actual code
+Groups never skip someone who requested an individual passoff. Selection stops before that student, even if it makes a smaller group. When they reach the front, `/next-group` removes nobody and tells the TA to use `/next-inperson` before calling another group. This prevents later arrivals from repeatedly overtaking them; TAs must serve individual students to keep the queue moving.
 
-After parsing the request data, the `run_action()` function in `slackbot.py` is the entry point to the actual command handlers.
+## Slack configuration
 
-#### Adding a new command
+Configure these settings before deploying:
 
-In the `run_action()` function, add your command to the relevant dict depending on whether it should be TA-only. The dict key is the slash-command itself (without the slash) and the value is the handler function for your command.
+1. Set `SLACK_BOT_TOKEN` to the app's bot OAuth token in the server environment inherited by PHP and Python. It is used to open the consent form.
+2. Set `SLACK_SIGNING_SECRET` to the app's Signing Secret in the PHP server environment. **The endpoint rejects all requests if this is missing.** Keep both secrets out of the repository.
+3. In the [Slack app settings](https://api.slack.com/apps), select TWEETER BOT and register the commands listed above under **Slash Commands**, using the same Request URL pointing to `index.php`. Register the group command as `/next-group` with usage hint `<number>`; remove any old `/next_group` registration. Enable **Escape channels, users, and links** for commands that accept user mentions.
+4. Enable **Interactivity & Shortcuts** and set its Request URL to the same endpoint so the bot receives form submissions.
 
-#### The handler function
+If the app is not visible, ask Dr. Rodham for workspace admin access. The popup uses Slack's [`views.open`](https://docs.slack.dev/reference/methods/views.open/) API and [modal submission callbacks](https://docs.slack.dev/surfaces/modals/).
 
-Your handler function (ex. `handle_cmd()`) must have the same signature as the existing ones, taking in a Request and returning None. The Request you're given will contain the calling user, any command args, etc.
+## Deployment and data
 
-To access the queue, create a PersistentQueue object (all instances access the same SQLite database). For fine-grained control of permissions, like if one subcommand is TA-only and another isn't, you can call `require_ta_or_halt()` or `p.is_user_a_ta()` from inside your handler function. To post a message as TweeterBot, call send_message(), optionally with `private=False` to broadcast to the whole channel. (You can also call `send_error()` if you reach an invalid state.) If your message contains user IDs, the message string should look like `f"foo <@{user_id}> baz"` for Slack to properly @-mention them (note, that's the user_id, _not_ the user_name). Avoid calling send_message() more than once--it works, but the resulting Slack message is in JSON format for some reason.
+Production is hosted on the CS lab machines at `/users/groups/cs340ta/public_html/slack`. SSH into a lab machine to access it. Contact OIT on the first floor of the TMCB if you need filesystem permissions.
 
-#### The Request object
+Commit and push from a local checkout, then pull changes on the server. Avoid committing from the lab machines because of repository permissions.
 
-The user_id of the user who ran the command is stored in `req.requester_id`. Arguments to your command can be accessed via the `req.args` list. (That list doesn't include the actual slash command; that is stored in `req.action`. For example, `/cmd arg1 arg2` will have `req.action == "cmd"` and `req.args == ["arg1", "arg2"]`.) If an argument is meant to be a user, call `parse_arg_as_user()` on it to get a (user_id, user_name) tuple. Note that the user_id is what is used everywhere, not the user_name. (It turns out the user_name is rarely useful, but it's there in case it's needed someday.) 
+The server needs PHP, Python 3.10 or newer with SQLite support, and write access to both `db/` and its database file. No third-party Python packages are required. Back up the database before deployment. Schema updates run automatically, preserving queue order. Legacy rows without a queue type become in-person entries; existing students without recorded consent default to individual-only passoff.
 
+TA access is stored in `secrets/ta_slack_member_ids.json`. If nobody has TA access, restore it from `secrets/backup_slack_member_ids.json` on the server, then use `/ta add` to grant access as needed.
 
+## Development
 
+`run()` routes slash commands to `run_action()` and modal submissions to `handle_interaction()`. To add a command, register its name without the leading slash in the student or TA-only handler dictionary. Handlers accept a `Request` and return `None`.
 
+The request exposes `action`, `args`, `requester_id`, and `trigger_id`. Use `PersistentQueue` for database access and `parse_arg_as_user()` for user mentions. Queue selection and removal happen in a single transaction to prevent concurrent TAs from calling the same student.
 
+Use `send_message()` for a private command response or `send_message(..., private=False)` for a channel announcement. Mention users as `<@USER_ID>`. Emit only one JSON response per request; modal submissions use Slack's response-action format.
