@@ -254,13 +254,20 @@ def handle_interaction(payload: dict[str, Any]) -> None:
         message = "This form was already processed or you are already in a queue. Use /wait to check your place."
     else:
         preference = "Group passoff is OK." if choice == "yes" else "Individual passoff only."
-        message = (f"You joined the in-person queue with {position} people ahead. "
+        total = total_ahead(PersistentQueue(), user_id)
+        message = (f"You joined the in-person queue with {position} people ahead in that queue "
+                   f"({total} ahead across both queues). "
                    f"{preference} Use /wait to check your place or /nevermind to leave.")
     print(json.dumps({"response_action": "update", "view": {
         "type": "modal", "title": {"type": "plain_text", "text": "Passoff queue"},
         "close": {"type": "plain_text", "text": "Done"},
         "blocks": [{"type": "section", "text": {"type": "plain_text", "text": message}}],
     }}))
+
+
+def total_ahead(p: "PersistentQueue", user_id: str) -> int:
+    users = [user for user, _ in p.get_entries()]
+    return users.index(user_id) if user_id in users else 0
 
 
 def build_queues_string(entries: list[tuple[str, str]]) -> str:
@@ -302,7 +309,9 @@ def handle_passoff(req: Request) -> None:
         send_message("You're already in a passoff queue! Use /nevermind before joining a different queue.")
         return
     label = "in-person" if queue_type == "inperson" else queue_type
-    send_message(f"You were added to the {label} passoff queue. There are {position} people in front of you in that queue.", private=False)
+    total = total_ahead(p, req.requester_id)
+    send_message(f"You were added to the {label} passoff queue. There are {position} people in front of you "
+                 f"in that queue, and {total} in front of you across both queues.", private=False)
 
 
 def handle_nevermind(req: Request) -> None:
