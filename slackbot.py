@@ -145,7 +145,7 @@ class PersistentQueue:
             ).fetchall()
             if entries and not entries[0][1]:
                 raise IndividualPassoffRequired(entries[0][0])
-            users = []
+            users: list[Any] = []
             for user, group_ok in entries:
                 # Never let a group overtake someone waiting for individual help.
                 if not group_ok or len(users) == count:
@@ -169,7 +169,7 @@ class Request:
         self.action: str = action
         self.args: list[str] = args
         self.requester_id: str = requester_id
-        self.trigger_id = trigger_id
+        self.trigger_id: str = trigger_id
 
 
 class Response:
@@ -440,9 +440,6 @@ def handle_bottest(req: Request) -> None:
     msg = f"action: '{req.action}'\nargs: {req.args}\nrequester_id: '{req.requester_id}'"
     send_message(msg)
 
-def handle_botter(req: Request) -> None:
-    send_message(f"Action: '{req.action}' was called by <@{req.requester_id}>")
-
 
 def run_action(req: Request) -> None:
     student_handlers: dict[str, Callable[[Request], None]] = {
@@ -462,8 +459,7 @@ def run_action(req: Request) -> None:
         "clearqueue": handle_clear_queue,
         "closequeue": handle_close_queue,
         "ta": handle_ta,
-        "bottest": handle_bottest,
-        "botter": handle_botter,
+        "bottest": handle_bottest
     }
 
     if req.action in student_handlers:
