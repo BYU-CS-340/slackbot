@@ -303,7 +303,7 @@ def handle_passoff(req: Request) -> None:
         if p.is_user_in_queue(req.requester_id):
             send_message("You're already in a passoff queue! Use /nevermind before joining a different queue.")
             return
-        open_consent_modal(req)
+        # open_consent_modal(req)
         return
     position = p.add_user_to_queue(req.requester_id, queue_type)
     if position is None:
