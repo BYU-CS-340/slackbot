@@ -13,6 +13,7 @@ import sqlite3
 
 
 TA_DICT_PATH = Path("./secrets/ta_slack_member_ids.json")
+SLACK_BOT_AUTHKEYS = Path("./secrets/ta_slack_member_ids.json")
 
 
 class IndividualPassoffRequired(Exception):
