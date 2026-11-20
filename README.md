@@ -41,8 +41,8 @@ Groups never skip someone who requested an individual passoff. Selection stops b
 
 Configure these settings before deploying:
 
-1. Set `SLACK_BOT_TOKEN` to the app's bot OAuth token in the server environment inherited by PHP and Python. It is used to open the consent form.
-2. Set `SLACK_SIGNING_SECRET` to the app's Signing Secret in the PHP server environment. **The endpoint rejects all requests if this is missing.** Keep both secrets out of the repository.
+1. Set `SLACK_BOT_TOKEN` in the JSON object `slackbot_authkeys` in the `/secrets` directory. It is used to open the consent form.
+2. Set `SLACK_SIGNING_SECRET` in the JSON object `slackbot_authkeys` in the `/secrets` directory. **The endpoint rejects all requests if this is missing.** Keep both secrets out of the repository.
 3. In the [Slack app settings](https://api.slack.com/apps), select TWEETER BOT and register the commands listed above under **Slash Commands**, using the same Request URL pointing to `index.php`. Register the group command as `/next-group` with usage hint `<number>`; remove any old `/next_group` registration. Enable **Escape channels, users, and links** for commands that accept user mentions.
 4. Enable **Interactivity & Shortcuts** and set its Request URL to the same endpoint so the bot receives form submissions.
 

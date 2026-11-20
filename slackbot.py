@@ -13,6 +13,7 @@ import sqlite3
 
 
 TA_DICT_PATH = Path("./secrets/ta_slack_member_ids.json")
+SLACKBOT_AUTHKEYS = Path("./secrets/slackbot_authkeys.json")
 
 
 class IndividualPassoffRequired(Exception):
@@ -193,7 +194,7 @@ class PrivateResponse(Response):
 
 
 def open_consent_modal(req: Request) -> None:
-    token = os.environ.get("SLACK_BOT_TOKEN")
+    token = load_slackbot_auth()["SLACK_BOT_TOKEN"]
     if not token or not req.trigger_id:
         send_message("Could not open the join form. Please contact a TA; you have not joined the queue.")
         return
@@ -538,6 +539,16 @@ def parse_args(args: list[str]) -> tuple[Any, Any]:
         send_error(f"Error decoding JSON arguments: {e}")
 
     return http_get_data, http_post_data
+
+
+def load_slackbot_auth() -> dict[str, str]:
+    try:
+        with SLACKBOT_AUTHKEYS.open("r") as f:
+            slackbot_auth = json.load(f)
+    except FileNotFoundError as e:
+        raise FileNotFoundError("The provided file was not found.") from e
+
+    return slackbot_auth
 
 
 def run(argv: list[str]) -> None:
